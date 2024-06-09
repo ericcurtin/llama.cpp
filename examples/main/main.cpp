@@ -355,7 +355,6 @@ int main(int argc, char ** argv) {
     // in instruct mode, we inject a prefix and a suffix to each input by the user
     if (params.instruct) {
         params.interactive_first = true;
-        params.antiprompt.emplace_back("### Instruction:\n\n");
     }
     // similar for chatml mode
     else if (params.chatml) {
@@ -822,7 +821,6 @@ int main(int argc, char ** argv) {
                     }
 
                     is_interacting = true;
-                    printf("\n");
                 } else if (params.instruct || params.chatml) {
                     is_interacting = true;
                 }
@@ -832,7 +830,7 @@ int main(int argc, char ** argv) {
                 LOG("waiting for user input\n");
 
                 if (params.conversation || params.instruct || params.chatml) {
-                    printf("\n> ");
+                    printf("%c> ", n_past < 2 ? '\0' : '\n');
                 }
 
                 if (params.input_prefix_bos) {
