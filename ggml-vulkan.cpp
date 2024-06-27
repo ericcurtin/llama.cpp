@@ -1593,13 +1593,6 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     vkGetPhysicalDeviceFeatures2(physical_device, &device_features2);
 
     fp16 = fp16 && vk12_features.shaderFloat16;
-
-    std::string device_name = props2.properties.deviceName.data();
-    std::cerr << GGML_VK_NAME << idx << ": " << device_name << " | uma: " << uma << " | fp16: " << fp16 << " | warp size: " << subgroup_size << std::endl;
-
-    if (props2.properties.deviceType == vk::PhysicalDeviceType::eCpu) {
-        std::cerr << "ggml_vulkan: Warning: Device type is CPU. This is probably not the device you want." << std::endl;
-    }
 }
 
 static bool ggml_vk_instance_validation_ext_available(const std::vector<vk::ExtensionProperties>& instance_extensions);
@@ -1700,8 +1693,6 @@ void ggml_vk_instance_init() {
             vk_instance.device_indices.push_back(0);
         }
     }
-
-    std::cerr << "ggml_vulkan: Found " << vk_instance.device_indices.size() << " Vulkan devices:" << std::endl;
 
     for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
         ggml_vk_print_gpu_info(i);
