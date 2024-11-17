@@ -8,97 +8,82 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "llama.h"
 
-struct Argument {
-    std::string flag;
-    std::string help_text;
-};
-
 class ArgumentParser {
-   public:
-    ArgumentParser(const char * program_name) : program_name(program_name) {}
+public:
+    ArgumentParser(const std::string& program_name) : program_name_(program_name) {}
 
-    void add_argument(const std::string & flag, std::string & var, const std::string & help_text = "") {
-        string_args[flag] = &var;
-        arguments.push_back({flag, help_text});
+    void add_argument(const std::string& name, const std::string& help = "", 
+                      const std::string& default_value = "", bool required = false) {
+        args_[name] = {help, default_value, required, false, ""};
     }
 
-    void add_argument(const std::string & flag, int & var, const std::string & help_text = "") {
-        int_args[flag] = &var;
-        arguments.push_back({flag, help_text});
-    }
-
-    int parse(int argc, const char ** argv) {
-        for (int i = 1; i < argc; ++i) {
-            std::string arg = argv[i];
-            if (string_args.count(arg)) {
-                if (i + 1 < argc) {
-                    *string_args[arg] = argv[++i];
-                } else {
-                    fprintf(stderr, "error: missing value for %s\n", arg.c_str());
-                    print_usage();
-                    return 1;
+    void parse_args(int argc, char* argv[]) {
+        std::vector<std::string> arguments(argv + 1, argv + argc);
+        for (size_t i = 0; i < arguments.size(); ++i) {
+            if (arguments[i].rfind("--", 0) == 0) { // Starts with '--'
+                std::string key = arguments[i].substr(2);
+                if (args_.find(key) == args_.end()) {
+                    throw std::invalid_argument("Unknown argument: " + key);
                 }
-            } else if (int_args.count(arg)) {
-                if (i + 1 < argc) {
-                    if (parse_int_arg(argv[++i], *int_args[arg]) != 0) {
-                        fprintf(stderr, "error: invalid value for %s: %s\n", arg.c_str(), argv[i]);
-                        print_usage();
-                        return 1;
-                    }
-                } else {
-                    fprintf(stderr, "error: missing value for %s\n", arg.c_str());
-                    print_usage();
-                    return 1;
+                if (i + 1 < arguments.size() && arguments[i + 1].rfind("--", 0) != 0) {
+                    args_[key].value = arguments[i + 1];
+                    args_[key].provided = true;
+                    ++i;
+                } else if (args_[key].default_value.empty()) {
+                    throw std::invalid_argument("Argument " + key + " requires a value");
                 }
             } else {
-                fprintf(stderr, "error: unrecognized argument %s\n", arg.c_str());
-                print_usage();
-                return 1;
+                throw std::invalid_argument("Unexpected argument: " + arguments[i]);
             }
         }
 
-        if (string_args["-m"]->empty()) {
-            fprintf(stderr, "error: -m is required\n");
-            print_usage();
-            return 1;
+        for (const auto& [key, arg] : args_) {
+            if (arg.required && !arg.provided) {
+                throw std::invalid_argument("Missing required argument: --" + key);
+            }
         }
-
-        return 0;
     }
 
-   private:
-    const char * program_name;
-    std::unordered_map<std::string, std::string *> string_args;
-    std::unordered_map<std::string, int *> int_args;
-    std::vector<Argument> arguments;
-
-    int parse_int_arg(const char * arg, int & value) {
-        char * end;
-        const long val = std::strtol(arg, &end, 10);
-        if (*end == '\0' && val >= INT_MIN && val <= INT_MAX) {
-            value = static_cast<int>(val);
-            return 0;
+    std::string get(const std::string& name) const {
+        if (args_.find(name) == args_.end()) {
+            throw std::invalid_argument("Argument not found: " + name);
         }
-        return 1;
+        return args_.at(name).provided ? args_.at(name).value : args_.at(name).default_value;
     }
 
-    void print_usage() const {
-        printf("\nUsage:\n");
-        printf("  %s [OPTIONS]\n\n", program_name);
-        printf("Options:\n");
-        for (const auto & arg : arguments) {
-            printf("  %-10s %s\n", arg.flag.c_str(), arg.help_text.c_str());
+    void print_help() const {
+        std::cout << "Usage: " << program_name_ << " [options]\n";
+        for (const auto& [key, arg] : args_) {
+            std::cout << "  --" << key << ": " << arg.help;
+            if (!arg.default_value.empty()) {
+                std::cout << " (default: " << arg.default_value << ")";
+            }
+            if (arg.required) {
+                std::cout << " [required]";
+            }
+            std::cout << "\n";
         }
-        printf("\n");
     }
+
+private:
+    struct Argument {
+        std::string help;
+        std::string default_value;
+        bool required;
+        bool provided;
+        std::string value;
+    };
+
+    std::string program_name_;
+    std::map<std::string, Argument> args_;
 };
 
 // Add a message to `messages` and store its content in `owned_content`
@@ -373,8 +358,37 @@ int main(int argc, const char ** argv) {
     std::string model_path, prompt_non_interactive;
     int ngl = 99;
     int n_ctx = 2048;
-    if (parse_arguments(argc, argv, model_path, prompt_non_interactive, n_ctx, ngl)) {
+    ArgumentParser parser;
+
+    // Add options
+    parser.add_option("n", "ngl", "Number of GPU layers", true);
+    parser.add_option("c", "context_size", "Context size", true);
+    parser.add_option("h", "help", "Show help message", false);
+
+    // Define program metadata
+    const std::string description = "Run a model\n\n"
+                                     "Description:\n  Runs a command in a new container from the given image";
+    const std::string usage = "llama-run [options] IMAGE [COMMAND [ARG...]]";
+    const std::vector<std::string> examples = {
+        "llama-run imageID ls -alF /etc",
+        "llama-run --network=host imageID dnf -y install java",
+        "llama-run --volume /var/hostdir:/var/ctrdir -i -t fedora /bin/bash"
+    };
+
+    // Parse arguments
+    std::unordered_map<std::string, std::string> parsed_options;
+    std::vector<std::string> positional_args;
+
+    if (!parser.parse(argc, argv, parsed_options, positional_args)) {
+        // Invalid arguments, show help
+        parser.generate_help(argv[0], description, usage, examples);
         return 1;
+    }
+
+    // Handle help flag
+    if (parsed_options.find("help") != parsed_options.end()) {
+        parser.generate_help(argv[0], description, usage, examples);
+        return 0;
     }
 
     if (!is_stdin_a_terminal()) {
