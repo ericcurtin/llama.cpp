@@ -21,7 +21,9 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <cstdarg>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <list>
@@ -782,6 +784,103 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
     }
 }
 
+// Extract model file from Docker container
+static bool common_download_docker_model(const std::string & docker_uri, const std::string & model_path) {
+    // Parse docker:// URI: docker://registry/repo:tag
+    if (!string_starts_with(docker_uri, "docker://")) {
+        LOG_ERR("error: invalid Docker URI format, expected docker://...\n");
+        return false;
+    }
+    
+    std::string docker_ref = docker_uri.substr(9); // Remove "docker://" prefix
+    if (docker_ref.empty()) {
+        LOG_ERR("error: empty Docker reference\n");
+        return false;
+    }
+    
+    LOG_INF("%s: pulling model from Docker: %s\n", __func__, docker_ref.c_str());
+    
+    // Create temporary directory for model extraction
+    std::string temp_dir = fs_get_cache_directory() + "/docker_models";
+    std::string mkdir_cmd = "mkdir -p " + temp_dir;
+    if (system(mkdir_cmd.c_str()) != 0) {
+        LOG_ERR("error: failed to create temporary directory: %s\n", temp_dir.c_str());
+        return false;
+    }
+    
+    // Pull the Docker image and extract the model file
+    // First try to find .gguf files in the container
+    std::string container_name = "llama_model_extract_" + std::to_string(std::time(nullptr));
+    std::string pull_cmd = "docker pull " + docker_ref;
+    std::string create_cmd = "docker create --name " + container_name + " " + docker_ref;
+    std::string find_cmd = "docker run --rm " + docker_ref + " find / -name '*.gguf' -type f 2>/dev/null | head -1";
+    
+    LOG_INF("%s: pulling Docker image...\n", __func__);
+    if (system(pull_cmd.c_str()) != 0) {
+        LOG_ERR("error: failed to pull Docker image: %s\n", docker_ref.c_str());
+        return false;
+    }
+    
+    // Find the model file in the container
+    LOG_INF("%s: finding model file in container...\n", __func__);
+    FILE* pipe = popen(find_cmd.c_str(), "r");
+    if (!pipe) {
+        LOG_ERR("error: failed to execute find command\n");
+        return false;
+    }
+    
+    char model_file_path[1024];
+    if (!fgets(model_file_path, sizeof(model_file_path), pipe)) {
+        pclose(pipe);
+        LOG_ERR("error: no .gguf model file found in Docker container\n");
+        return false;
+    }
+    pclose(pipe);
+    
+    // Remove newline from path
+    size_t len = strlen(model_file_path);
+    if (len > 0 && model_file_path[len-1] == '\n') {
+        model_file_path[len-1] = '\0';
+    }
+    
+    LOG_INF("%s: found model file: %s\n", __func__, model_file_path);
+    
+    // Create container and copy the model file
+    if (system(create_cmd.c_str()) != 0) {
+        LOG_ERR("error: failed to create Docker container\n");
+        return false;
+    }
+    
+    std::string copy_cmd = "docker cp " + container_name + ":" + std::string(model_file_path) + " " + model_path;
+    std::string cleanup_cmd = "docker rm " + container_name;
+    
+    LOG_INF("%s: copying model file to: %s\n", __func__, model_path.c_str());
+    bool success = (system(copy_cmd.c_str()) == 0);
+    
+    // Cleanup container
+    (void)system(cleanup_cmd.c_str());
+    
+    if (!success) {
+        LOG_ERR("error: failed to copy model file from Docker container\n");
+        return false;
+    }
+    
+    // Verify the file exists and is not empty
+    if (!std::filesystem::exists(model_path)) {
+        LOG_ERR("error: extracted model file does not exist\n");
+        return false;
+    }
+    
+    auto file_size = std::filesystem::file_size(model_path);
+    if (file_size == 0) {
+        LOG_ERR("error: extracted model file is empty\n");
+        return false;
+    }
+    
+    LOG_INF("%s: successfully extracted model (%zu bytes) from Docker container\n", __func__, file_size);
+    return true;
+}
+
 struct handle_model_result {
     bool found_mmproj = false;
     common_params_model mmproj;
@@ -793,6 +892,40 @@ static handle_model_result common_params_handle_model(
         const std::string & model_path_default,
         bool offline) {
     handle_model_result result;
+    
+    // handle Docker URI: docker://registry/repo:tag
+    if (string_starts_with(model.path, "docker://")) {
+        std::string docker_uri = model.path;
+        
+        // Generate cache path for the Docker model
+        std::string docker_ref = docker_uri.substr(9); // Remove "docker://" prefix
+        std::string cache_filename = docker_ref;
+        // Replace slashes and colons with underscores for safe filename
+        string_replace_all(cache_filename, "/", "_");
+        string_replace_all(cache_filename, ":", "_");
+        cache_filename += ".gguf";
+        
+        std::string cached_model_path = fs_get_cache_file(cache_filename);
+        
+        // Check if we already have the model cached
+        if (std::filesystem::exists(cached_model_path) && !offline) {
+            LOG_INF("%s: using cached Docker model: %s\n", __func__, cached_model_path.c_str());
+            model.path = cached_model_path;
+        } else {
+            if (offline) {
+                LOG_ERR("error: Docker model not cached and offline mode is enabled\n");
+                exit(1);
+            }
+            // Download model from Docker container
+            if (!common_download_docker_model(docker_uri, cached_model_path)) {
+                LOG_ERR("error: failed to download model from Docker container: %s\n", docker_uri.c_str());
+                exit(1);
+            }
+            model.path = cached_model_path;
+        }
+        return result;
+    }
+    
     // handle pre-fill default model path and url based on hf_repo and hf_file
     {
         if (!model.hf_repo.empty()) {
