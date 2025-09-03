@@ -808,18 +808,26 @@ static bool common_download_docker_model(const std::string & docker_uri, const s
         return false;
     }
     
+    // Check if image exists locally first
+    std::string check_cmd = "docker image inspect " + docker_ref + " >/dev/null 2>&1";
+    bool image_exists_locally = (system(check_cmd.c_str()) == 0);
+    
+    if (!image_exists_locally) {
+        // Pull the Docker image
+        std::string pull_cmd = "docker pull " + docker_ref;
+        LOG_INF("%s: pulling Docker image...\n", __func__);
+        if (system(pull_cmd.c_str()) != 0) {
+            LOG_ERR("error: failed to pull Docker image: %s\n", docker_ref.c_str());
+            return false;
+        }
+    } else {
+        LOG_INF("%s: using local Docker image: %s\n", __func__, docker_ref.c_str());
+    }
+    
     // Pull the Docker image and extract the model file
     // First try to find .gguf files in the container
     std::string container_name = "llama_model_extract_" + std::to_string(std::time(nullptr));
-    std::string pull_cmd = "docker pull " + docker_ref;
-    std::string create_cmd = "docker create --name " + container_name + " " + docker_ref;
     std::string find_cmd = "docker run --rm " + docker_ref + " find / -name '*.gguf' -type f 2>/dev/null | head -1";
-    
-    LOG_INF("%s: pulling Docker image...\n", __func__);
-    if (system(pull_cmd.c_str()) != 0) {
-        LOG_ERR("error: failed to pull Docker image: %s\n", docker_ref.c_str());
-        return false;
-    }
     
     // Find the model file in the container
     LOG_INF("%s: finding model file in container...\n", __func__);
@@ -846,6 +854,7 @@ static bool common_download_docker_model(const std::string & docker_uri, const s
     LOG_INF("%s: found model file: %s\n", __func__, model_file_path);
     
     // Create container and copy the model file
+    std::string create_cmd = "docker create --name " + container_name + " " + docker_ref;
     if (system(create_cmd.c_str()) != 0) {
         LOG_ERR("error: failed to create Docker container\n");
         return false;
