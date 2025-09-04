@@ -11,6 +11,12 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+// Performance optimization headers
+#include "memory-pool.h"
+#include "enhanced-scheduler.h"
+#include "optimal-batcher.h"
+#include "performance-monitor.h"
+
 // mime type for sending response
 #define MIMETYPE_JSON "application/json; charset=utf-8"
 
@@ -1868,6 +1874,25 @@ struct server_queue {
 
             callback_update_slots();
 
+            // Performance monitoring: Update resource utilization periodically
+            // TODO: In a real implementation, these would come from system monitoring
+            // For now, we'll use placeholder values that would be populated by actual monitoring
+            static auto last_perf_update = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            auto perf_interval = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - last_perf_update);
+            
+            if (perf_interval.count() > 1000) {  // Update every second
+                // In production, these would be real system metrics
+                float gpu_util = 0.75f;  // Would come from nvidia-ml or similar
+                float memory_util = 0.65f;  // Would come from system monitoring
+                float cpu_util = 0.45f;   // Would come from system monitoring
+                
+                // Update performance monitoring (this would be integrated with the main server context)
+                // perf_monitor.update_resource_utilization(gpu_util, memory_util, cpu_util);
+                last_perf_update = now;
+            }
+
             QUE_DBG("%s", "waiting for new tasks\n");
             {
                 std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -2066,6 +2091,11 @@ struct server_context {
     server_response queue_results;
 
     server_metrics metrics;
+
+    // Performance optimization components
+    llama::performance_monitor perf_monitor;
+    llama::enhanced_scheduler enhanced_scheduler;
+    llama::optimal_batcher optimal_batcher;
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
@@ -3240,9 +3270,42 @@ struct server_context {
         int32_t n_batch  = llama_n_batch(ctx);
         int32_t n_ubatch = llama_n_ubatch(ctx);
 
+        // Enhanced batching: Create optimal batch candidates
+        std::vector<llama::batch_candidate> candidates;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            auto& slot = slots[i];
+            if (slot.is_processing()) {
+                bool is_prompt = (slot.state == SLOT_STATE_PROCESSING_PROMPT || 
+                                slot.state == SLOT_STATE_STARTED);
+                size_t token_count = is_prompt ? 
+                    (slot.n_prompt_tokens - slot.n_prompt_tokens_processed) : 1;
+                int priority = 0;  // Default priority, could be enhanced with task-specific priorities
+                
+                candidates.emplace_back(i, token_count, slot.n_ctx, is_prompt, priority);
+            }
+        }
+
+        // Get optimal batch order if we have candidates
+        std::vector<int> optimal_order;
+        if (!candidates.empty()) {
+            optimal_order = optimal_batcher.create_optimal_batch(candidates);
+        }
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.n_tokens == 0) {
-            for (auto & slot : slots) {
+            // Process slots in optimal order if available, otherwise use existing order
+            auto process_slots = optimal_order.empty() ? 
+                std::vector<int>{} : optimal_order;
+            
+            if (process_slots.empty()) {
+                // Fallback to existing logic
+                for (size_t i = 0; i < slots.size(); ++i) {
+                    process_slots.push_back(i);
+                }
+            }
+            
+            for (int slot_idx : process_slots) {
+                auto & slot = slots[slot_idx];
                 // check if we can batch this slot with the previous one
                 if (slot.is_processing()) {
                     if (!slot_batched) {
@@ -3618,7 +3681,27 @@ struct server_context {
                 batch.logits   + i,
             };
 
+            // Performance monitoring: record batch processing start
+            auto decode_start = std::chrono::steady_clock::now();
+            perf_monitor.record_batch_processed(batch_view.n_tokens, 0);
+
             const int ret = llama_decode(ctx, batch_view);
+
+            // Performance monitoring: record completion time
+            auto decode_end = std::chrono::steady_clock::now();
+            auto decode_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                decode_end - decode_start).count();
+            
+            // Update metrics with actual processing time
+            for (const auto& slot : slots) {
+                if (slot.is_processing()) {
+                    perf_monitor.record_request_completed(
+                        batch_view.n_tokens / slots.size(),  // tokens per request approximation
+                        decode_time_us / slots.size(),       // processing time per request
+                        0  // queue time - would need to track separately
+                    );
+                }
+            }
 
             metrics.on_decoded(slots);
 
@@ -4238,6 +4321,50 @@ int main(int argc, char ** argv) {
 
         res.set_content(prometheus.str(), "text/plain; version=0.0.4");
         res.status = 200; // HTTP OK
+    };
+
+    // Enhanced performance metrics endpoint for detailed optimization insights
+    const auto handle_performance_metrics = [&ctx_server, &res_ok](const httplib::Request &, httplib::Response & res) {
+        size_t active_slots = 0;
+        size_t pending_tasks = 0;
+        
+        for (const auto& slot : ctx_server.slots) {
+            if (slot.is_processing()) {
+                active_slots++;
+            }
+        }
+        pending_tasks = ctx_server.queue_tasks.queue_tasks.size();
+        
+        // Get current performance snapshot
+        auto snapshot = ctx_server.perf_monitor.get_current_snapshot(active_slots, pending_tasks);
+        auto recommendations = ctx_server.perf_monitor.get_optimization_recommendations();
+        
+        // Create detailed performance response
+        json perf_data = {
+            {"timestamp", std::chrono::duration_cast<std::chrono::milliseconds>(
+                snapshot.timestamp.time_since_epoch()).count()},
+            {"throughput", {
+                {"tokens_per_second", snapshot.tokens_per_second},
+                {"requests_per_second", snapshot.requests_per_second},
+                {"avg_batch_size", snapshot.avg_batch_size}
+            }},
+            {"latency", {
+                {"avg_processing_ms", snapshot.avg_latency_ms},
+                {"avg_queue_time_ms", snapshot.avg_queue_time_ms}
+            }},
+            {"utilization", {
+                {"gpu_percent", snapshot.gpu_utilization * 100},
+                {"memory_percent", snapshot.memory_utilization * 100},
+                {"cache_hit_rate_percent", snapshot.cache_hit_rate * 100}
+            }},
+            {"active_workload", {
+                {"active_sequences", snapshot.active_sequences},
+                {"pending_requests", snapshot.pending_requests}
+            }},
+            {"optimization_recommendations", recommendations}
+        };
+        
+        res_ok(res, perf_data);
     };
 
     const auto handle_slots_save = [&ctx_server, &res_error, &res_ok, &params](const httplib::Request & req, httplib::Response & res, int id_slot) {
@@ -5060,6 +5187,7 @@ int main(int argc, char ** argv) {
     // register API routes
     svr->Get (params.api_prefix + "/health",              handle_health); // public endpoint (no API key check)
     svr->Get (params.api_prefix + "/metrics",             handle_metrics);
+    svr->Get (params.api_prefix + "/performance",         handle_performance_metrics); // Enhanced performance metrics
     svr->Get (params.api_prefix + "/props",               handle_props);
     svr->Post(params.api_prefix + "/props",               handle_props_change);
     svr->Post(params.api_prefix + "/api/show",            handle_api_show);
