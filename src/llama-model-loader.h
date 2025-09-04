@@ -177,6 +177,11 @@ struct llama_model_loader {
 
     void print_info() const;
 
+public:
+    // For testing purposes, make these methods public
+    llama_file_type detect_file_type(const std::string & fname);
+    ggml_type safetensors_dtype_to_ggml_type(const std::string & dtype);
+    
 private:
     // Safetensors support
     struct safetensors_tensor_info {
@@ -187,7 +192,5 @@ private:
     
     std::unordered_map<std::string, safetensors_tensor_info> safetensors_tensors;
     
-    llama_file_type detect_file_type(const std::string & fname);
     void load_safetensors_file(const std::string & fname);
-    ggml_type safetensors_dtype_to_ggml_type(const std::string & dtype);
 };
