@@ -67,6 +67,7 @@ void common_log_add(struct common_log * log, enum ggml_log_level level, const ch
 
 void common_log_set_file      (struct common_log * log, const char * file);       // not thread-safe
 void common_log_set_colors    (struct common_log * log,       bool   colors);     // not thread-safe
+void common_log_set_colors_auto(struct common_log * log);                         // auto-detect colors based on terminal, not thread-safe
 void common_log_set_prefix    (struct common_log * log,       bool   prefix);     // whether to output prefix to each log
 void common_log_set_timestamps(struct common_log * log,       bool   timestamps); // whether to output timestamps in the prefix
 

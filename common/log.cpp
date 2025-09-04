@@ -8,11 +8,50 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+#include <cstdlib>
+#include <cstring>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#define isatty _isatty
+#define fileno _fileno
+#else
+#include <unistd.h>
+#endif
 
 int common_log_verbosity_thold = LOG_DEFAULT_LLAMA;
 
 void common_log_set_verbosity_thold(int verbosity) {
     common_log_verbosity_thold = verbosity;
+}
+
+// Auto-detect if colors should be enabled based on terminal and environment
+static bool common_log_should_use_colors_auto() {
+    // Check NO_COLOR environment variable (https://no-color.org/)
+    if (const char* no_color = std::getenv("NO_COLOR")) {
+        if (no_color[0] != '\0') {
+            return false;
+        }
+    }
+
+    // Check TERM environment variable
+    if (const char* term = std::getenv("TERM")) {
+        if (std::strcmp(term, "dumb") == 0) {
+            return false;
+        }
+    }
+
+    // Check if stdout and stderr are connected to a terminal
+    // We check both because log messages can go to either
+    bool stdout_is_tty = isatty(fileno(stdout)) != 0;
+    bool stderr_is_tty = isatty(fileno(stderr)) != 0;
+    
+    return stdout_is_tty || stderr_is_tty;
 }
 
 static int64_t t_us() {
@@ -353,6 +392,13 @@ struct common_log * common_log_init() {
 
 struct common_log * common_log_main() {
     static struct common_log log;
+    static bool initialized = false;
+    
+    if (!initialized) {
+        // Set default to auto-detect colors
+        log.set_colors(common_log_should_use_colors_auto());
+        initialized = true;
+    }
 
     return &log;
 }
@@ -382,6 +428,10 @@ void common_log_set_file(struct common_log * log, const char * file) {
 
 void common_log_set_colors(struct common_log * log, bool colors) {
     log->set_colors(colors);
+}
+
+void common_log_set_colors_auto(struct common_log * log) {
+    log->set_colors(common_log_should_use_colors_auto());
 }
 
 void common_log_set_prefix(struct common_log * log, bool prefix) {
