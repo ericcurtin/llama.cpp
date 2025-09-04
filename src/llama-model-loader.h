@@ -42,6 +42,13 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+
+        // Constructor for safetensors format
+        llama_tensor_weight(const llama_file * file, uint16_t idx, size_t offset, ggml_tensor * tensor) : idx(idx), offs(offset), tensor(tensor) {
+            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+                throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
+            }
+        }
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -165,6 +172,10 @@ struct llama_model_loader {
             void * progress_callback_user_data);
 
     std::string ftype_name() const;
+
+    // Safetensors support functions
+    static bool is_safetensors_file(const std::string & fname);
+    void load_safetensors_file(const std::string & fname, struct ggml_context * ctx);
 
     void print_info() const;
 };

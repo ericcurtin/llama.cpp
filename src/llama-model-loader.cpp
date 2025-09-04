@@ -6,6 +6,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <future>
+#include "../vendor/nlohmann/json.hpp"
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -485,6 +486,31 @@ llama_model_loader::llama_model_loader(
     }
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
+
+    // Check if this is a safetensors file
+    if (is_safetensors_file(fname)) {
+        // Create a minimal ggml context for tensor creation
+        struct ggml_init_params ggml_params = {
+            /*.mem_size   =*/ 1024 * 1024, // 1MB should be enough for tensor metadata
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        struct ggml_context * ctx = ggml_init(ggml_params);
+        if (!ctx) {
+            throw std::runtime_error(format("%s: failed to create ggml context", __func__));
+        }
+
+        // Load safetensors file
+        load_safetensors_file(fname, ctx);
+        
+        // For safetensors, we need to set some default values since we don't have GGUF metadata
+        arch_name = "llama"; // Default to llama architecture
+        llm_kv = LLM_KV(LLM_ARCH_LLAMA);
+        ftype = LLAMA_FTYPE_ALL_F32; // Default file type
+        fver = GGUF_FILE_VERSION_V3; // Use latest version
+        
+        return;
+    }
 
     // Load the main GGUF
     struct ggml_context * ctx = NULL;
@@ -1162,4 +1188,136 @@ void llama_model_loader::print_info() const {
     } else {
         LLAMA_LOG_INFO("%s: file size   = %.2f GiB (%.2f BPW) \n", __func__, n_bytes/1024.0/1024.0/1024.0, n_bytes*8.0/n_elements);
     }
+}
+
+//
+// Safetensors format support
+//
+
+bool llama_model_loader::is_safetensors_file(const std::string & fname) {
+    // Check file extension
+    if (fname.size() < 12 || fname.substr(fname.size() - 12) != ".safetensors") {
+        return false;
+    }
+    
+    // Try to read the file header to confirm
+    try {
+        llama_file file(fname.c_str(), "rb");
+        if (file.size() < 8) {
+            return false;
+        }
+        
+        // Read the header length (8 bytes, little-endian uint64)
+        uint64_t header_len = 0;
+        file.read_raw(&header_len, sizeof(header_len));
+        
+        // Basic sanity check: header should be reasonable size
+        if (header_len == 0 || header_len > file.size() || header_len > 1024*1024) {
+            return false;
+        }
+        
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static ggml_type safetensors_dtype_to_ggml_type(const std::string & dtype) {
+    if (dtype == "F32") return GGML_TYPE_F32;
+    if (dtype == "F16") return GGML_TYPE_F16;
+    if (dtype == "BF16") return GGML_TYPE_BF16;
+    if (dtype == "I8") return GGML_TYPE_I8;
+    if (dtype == "I16") return GGML_TYPE_I16;
+    if (dtype == "I32") return GGML_TYPE_I32;
+    if (dtype == "I64") return GGML_TYPE_I64;
+    // Map unsigned integers to signed equivalents (common practice)
+    if (dtype == "U8") return GGML_TYPE_I8;
+    if (dtype == "U16") return GGML_TYPE_I16;
+    if (dtype == "U32") return GGML_TYPE_I32;
+    if (dtype == "U64") return GGML_TYPE_I64;
+    if (dtype == "BOOL") return GGML_TYPE_I8; // Map BOOL to I8
+    
+    throw std::runtime_error("unsupported safetensors dtype: " + dtype);
+}
+
+void llama_model_loader::load_safetensors_file(const std::string & fname, struct ggml_context * ctx) {
+    LLAMA_LOG_INFO("%s: loading safetensors file '%s'\n", __func__, fname.c_str());
+    
+    auto file = std::make_unique<llama_file>(fname.c_str(), "rb");
+    
+    // Read header length (8 bytes, little-endian uint64)
+    uint64_t header_len = 0;
+    file->read_raw(&header_len, sizeof(header_len));
+    
+    if (header_len == 0 || header_len > file->size()) {
+        throw std::runtime_error("invalid safetensors header length");
+    }
+    
+    // Read JSON header
+    std::vector<char> header_data(header_len);
+    file->read_raw(header_data.data(), header_len);
+    
+    std::string header_str(header_data.begin(), header_data.end());
+    
+    // Parse JSON
+    nlohmann::json header;
+    try {
+        header = nlohmann::json::parse(header_str);
+    } catch (const std::exception & e) {
+        throw std::runtime_error("failed to parse safetensors header JSON: " + std::string(e.what()));
+    }
+    
+    // Calculate data section offset
+    size_t data_offset = 8 + header_len;
+    
+    // Process each tensor
+    for (auto & [tensor_name, tensor_info] : header.items()) {
+        // Skip metadata entry
+        if (tensor_name == "__metadata__") {
+            continue;
+        }
+        
+        if (!tensor_info.contains("dtype") || !tensor_info.contains("shape") || !tensor_info.contains("data_offsets")) {
+            throw std::runtime_error("incomplete tensor info for: " + tensor_name);
+        }
+        
+        std::string dtype = tensor_info["dtype"];
+        std::vector<int64_t> shape = tensor_info["shape"];
+        std::vector<size_t> data_offsets = tensor_info["data_offsets"];
+        
+        if (data_offsets.size() != 2) {
+            throw std::runtime_error("invalid data_offsets for tensor: " + tensor_name);
+        }
+        
+        ggml_type ggml_dtype = safetensors_dtype_to_ggml_type(dtype);
+        
+        // Create tensor in ggml context
+        ggml_tensor * tensor = ggml_new_tensor(ctx, ggml_dtype, shape.size(), shape.data());
+        if (!tensor) {
+            throw std::runtime_error("failed to create tensor: " + tensor_name);
+        }
+        
+        ggml_set_name(tensor, tensor_name.c_str());
+        
+        // Calculate absolute offset in file
+        size_t tensor_offset = data_offset + data_offsets[0];
+        
+        // Verify tensor data fits in file
+        size_t tensor_size = data_offsets[1] - data_offsets[0];
+        if (tensor_offset + tensor_size > file->size()) {
+            throw std::runtime_error("tensor data exceeds file size for: " + tensor_name);
+        }
+        
+        // Add to weights map
+        weights_map.emplace(tensor_name, llama_tensor_weight(file.get(), 0, tensor_offset, tensor));
+        
+        n_elements += ggml_nelements(tensor);
+        n_bytes += ggml_nbytes(tensor);
+    }
+    
+    // Store the file
+    files.emplace_back(std::move(file));
+    contexts.emplace_back(ctx);
+    
+    LLAMA_LOG_INFO("%s: loaded %zu tensors from safetensors file\n", __func__, weights_map.size());
 }

@@ -179,6 +179,7 @@ std::string common_arg::to_string() {
 struct common_hf_file_res {
     std::string repo; // repo name with ":tag" removed
     std::string ggufFile;
+    std::string safetensorsFile;
     std::string mmprojFile;
 };
 
@@ -669,6 +670,7 @@ static struct common_hf_file_res common_get_hf_file(const std::string & hf_repo_
         }
     }
     std::string ggufFile;
+    std::string safetensorsFile;
     std::string mmprojFile;
 
     if (res_code == 200 || res_code == 304) {
@@ -698,12 +700,61 @@ static struct common_hf_file_res common_get_hf_file(const std::string & hf_repo_
         throw std::runtime_error(string_format("error from HF API, response code: %ld, data: %s", res_code, res_str.c_str()));
     }
 
-    // check response
-    if (ggufFile.empty()) {
-        throw std::runtime_error("error: model does not have ggufFile");
+    // If no gguf file found, try to find safetensors files
+    if (ggufFile.empty() && !offline) {
+        LOG_INF("No GGUF file found, searching for safetensors files...\n");
+        
+        // Query repository tree to find safetensors files
+        std::string tree_url = get_model_endpoint() + "api/models/" + hf_repo + "/tree/main";
+        
+        std::vector<std::string> headers;
+        headers.push_back("Accept: application/json");
+        if (!bearer_token.empty()) {
+            headers.push_back("Authorization: Bearer " + bearer_token);
+        }
+        
+        common_remote_params tree_params;
+        tree_params.headers = headers;
+        
+        try {
+            auto tree_res = common_remote_get_content(tree_url, tree_params);
+            if (tree_res.first == 200) {
+                std::string tree_str = std::string(tree_res.second.data(), tree_res.second.size());
+                
+                // Look for .safetensors files in the response
+                std::regex safetensors_pattern("\"path\"\\s*:\\s*\"([^\"]*\\.safetensors)\"");
+                std::smatch match;
+                std::string::const_iterator searchStart(tree_str.cbegin());
+                
+                std::vector<std::string> safetensors_files;
+                while (std::regex_search(searchStart, tree_str.cend(), match, safetensors_pattern)) {
+                    safetensors_files.push_back(match[1].str());
+                    searchStart = match.suffix().first;
+                }
+                
+                if (!safetensors_files.empty()) {
+                    // Prefer model.safetensors or choose the first one
+                    safetensorsFile = safetensors_files[0];
+                    for (const auto& filename : safetensors_files) {
+                        if (filename == "model.safetensors" || filename.find("model") != std::string::npos) {
+                            safetensorsFile = filename;
+                            break;
+                        }
+                    }
+                    LOG_INF("Found safetensors file: %s\n", safetensorsFile.c_str());
+                }
+            }
+        } catch (const std::exception & e) {
+            LOG_WRN("Failed to query repository tree for safetensors files: %s\n", e.what());
+        }
     }
 
-    return { hf_repo, ggufFile, mmprojFile };
+    // check response
+    if (ggufFile.empty() && safetensorsFile.empty()) {
+        throw std::runtime_error("error: model does not have ggufFile or safetensors file");
+    }
+
+    return { hf_repo, ggufFile, safetensorsFile, mmprojFile };
 }
 
 #else
@@ -800,11 +851,16 @@ static handle_model_result common_params_handle_model(
             if (model.hf_file.empty()) {
                 if (model.path.empty()) {
                     auto auto_detected = common_get_hf_file(model.hf_repo, bearer_token, offline);
-                    if (auto_detected.repo.empty() || auto_detected.ggufFile.empty()) {
+                    if (auto_detected.repo.empty() || (auto_detected.ggufFile.empty() && auto_detected.safetensorsFile.empty())) {
                         exit(1); // built without CURL, error message already printed
                     }
                     model.hf_repo = auto_detected.repo;
-                    model.hf_file = auto_detected.ggufFile;
+                    // Prefer gguf files, fall back to safetensors
+                    if (!auto_detected.ggufFile.empty()) {
+                        model.hf_file = auto_detected.ggufFile;
+                    } else {
+                        model.hf_file = auto_detected.safetensorsFile;
+                    }
                     if (!auto_detected.mmprojFile.empty()) {
                         result.found_mmproj   = true;
                         result.mmproj.hf_repo = model.hf_repo;
