@@ -3135,10 +3135,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--log-colors"},
-        "Enable colored logging",
-        [](common_params &) {
-            common_log_set_colors(common_log_main(), true);
+        {"--log-colors"}, "[always|never|auto]",
+        "Enable colored logging. Options are 'always', 'never', or 'auto' (default: auto)\n"
+        "'auto' enables colors when output is to a terminal",
+        [](common_params &, const std::string & value) {
+            if (value == "always") {
+                common_log_set_colors(common_log_main(), true);
+            } else if (value == "never") {
+                common_log_set_colors(common_log_main(), false);
+            } else if (value == "auto") {
+                common_log_set_colors_auto(common_log_main());
+            } else {
+                throw std::invalid_argument("--log-colors must be 'always', 'never', or 'auto'");
+            }
         }
     ).set_env("LLAMA_LOG_COLORS"));
     add_opt(common_arg(
