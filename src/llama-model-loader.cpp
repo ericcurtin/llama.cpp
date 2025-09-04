@@ -473,10 +473,6 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
-    int trace = 0;
-    if (getenv("LLAMA_TRACE")) {
-        trace = atoi(getenv("LLAMA_TRACE"));
-    }
 
     if (param_overrides_p != nullptr) {
         for (const struct llama_model_kv_override * p = param_overrides_p; p->key[0] != 0; p++) {
@@ -486,6 +482,21 @@ llama_model_loader::llama_model_loader(
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
+    // Store parameters
+    this->use_mmap = use_mmap;
+    this->check_tensors = check_tensors;
+
+    // Detect file format
+    if (is_safetensors_file(fname)) {
+        fformat = LLAMA_FFORMAT_SAFETENSORS;
+        load_safetensors_model(fname);
+    } else {
+        fformat = LLAMA_FFORMAT_GGUF;
+        load_gguf_model(fname, splits);
+    }
+}
+
+void llama_model_loader::load_gguf_model(const std::string & fname, std::vector<std::string> & splits) {
     // Load the main GGUF
     struct ggml_context * ctx = NULL;
     struct gguf_init_params params = {
@@ -538,6 +549,11 @@ llama_model_loader::llama_model_loader(
         // in case user give a custom list of splits, check if it matches the expected number
         if (n_split != (uint16_t)splits.size()) {
             throw std::runtime_error(format("invalid split count, given: %zu splits, but expected %d", splits.size(), n_split));
+        }
+
+        int trace = 0;
+        if (getenv("LLAMA_TRACE")) {
+            trace = atoi(getenv("LLAMA_TRACE"));
         }
 
         if (trace > 0) {
@@ -613,6 +629,11 @@ llama_model_loader::llama_model_loader(
 
         uint32_t n_type_max = 0;
         enum ggml_type type_max = GGML_TYPE_F32;
+
+        int trace = 0;
+        if (getenv("LLAMA_TRACE")) {
+            trace = atoi(getenv("LLAMA_TRACE"));
+        }
 
         for (const auto & it : weights_map) {
             const llama_tensor_weight & w = it.second;
@@ -709,11 +730,33 @@ llama_model_loader::llama_model_loader(
 
     if (!llama_mmap::SUPPORTED) {
         LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
-        use_mmap = false;
+        this->use_mmap = false;
     }
+}
 
-    this->use_mmap = use_mmap;
-    this->check_tensors = check_tensors;
+void llama_model_loader::load_safetensors_model(const std::string & fname) {
+    LLAMA_LOG_INFO("%s: loading safetensors model from %s\n", __func__, fname.c_str());
+    
+    try {
+        safetensors_file = std::make_unique<llama_safetensors_file>(fname);
+        const auto & meta = safetensors_file->get_metadata();
+        
+        LLAMA_LOG_INFO("%s: safetensors file loaded with %zu tensors\n", __func__, meta.tensors.size());
+        
+        // For now, we need model architecture info from a config.json file
+        // In a complete implementation, this would:
+        // 1. Download/read config.json from HuggingFace repository
+        // 2. Parse model architecture, vocabulary, etc.  
+        // 3. Create ggml tensors from safetensors data
+        // 4. Set up model metadata
+        
+        throw std::runtime_error("Safetensors support is partially implemented. "
+                                "Need to fetch model config.json for architecture information. "
+                                "Please use GGUF format models for now.");
+        
+    } catch (const std::exception & e) {
+        throw std::runtime_error(format("Failed to load safetensors model: %s", e.what()));
+    }
 }
 
 std::string llama_model_loader::get_arch_name() const {
