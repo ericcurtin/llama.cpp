@@ -3,10 +3,6 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <fcntl.h>
 #include <cerrno>
 #include <cstdlib>
 #include <sstream>
@@ -16,17 +12,45 @@
 #include <chrono>
 #include <cstring>
 #include <cassert>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <process.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#endif
 
 #if defined(LLAMA_USE_CURL)
 #include <curl/curl.h>
 
 #include "linenoise.cpp/linenoise.h"
 
+// Platform-specific definitions
+#if defined(_WIN32)
+typedef HANDLE process_handle_t;
+typedef DWORD process_id_t;
+#define INVALID_PROCESS_HANDLE INVALID_HANDLE_VALUE
+#else
+typedef pid_t process_handle_t;
+typedef pid_t process_id_t;
+#define INVALID_PROCESS_HANDLE -1
+#endif
+
 // Global variables for process management
-static pid_t server_pid = -1;
+static process_handle_t server_process = INVALID_PROCESS_HANDLE;
 static std::atomic<bool> server_ready{false};
 static std::atomic<bool> should_exit{false};
 static std::atomic<bool> interrupt_response{false};
@@ -185,41 +209,79 @@ private:
 };
 
 // Signal handlers
+#if !defined(_WIN32)
 static void sigint_handler(int sig) {
     (void)sig;
     // Set flag to interrupt response, but don't print here
     interrupt_response.store(true);
 }
 
-static int cleanup_and_exit(int exit_code) {
-    if (server_pid > 0) {
-        if (kill(server_pid, SIGTERM) == -1) {
-            LOG_ERR("kill failed");
-        }
-
-        if (waitpid(server_pid, nullptr, 0) == -1) {
-            LOG_ERR("waitpid failed");
-        }
-    }
-
-    return exit_code;
-}
-
 static void sigterm_handler(int sig) {
     (void)sig;
     should_exit.store(true);
 }
+#endif
+
+static int cleanup_and_exit(int exit_code) {
+#if defined(_WIN32)
+    if (server_process != INVALID_PROCESS_HANDLE) {
+        TerminateProcess(server_process, 0);
+        WaitForSingleObject(server_process, INFINITE);
+        CloseHandle(server_process);
+    }
+#else
+    if (server_process != INVALID_PROCESS_HANDLE) {
+        if (kill(server_process, SIGTERM) == -1) {
+            LOG_ERR("kill failed");
+        }
+
+        if (waitpid(server_process, nullptr, 0) == -1) {
+            LOG_ERR("waitpid failed");
+        }
+    }
+#endif
+
+    return exit_code;
+}
 
 // Start llama-server process
 static bool start_server(const std::vector<std::string> & args, int port) {
-    server_pid = fork();
+#if defined(_WIN32)
+    // Windows implementation using CreateProcess
+    std::string command_line = "llama-server --port " + std::to_string(port);
     
-    if (server_pid == -1) {
+    // Add all original arguments except the program name
+    for (size_t i = 1; i < args.size(); ++i) {
+        // Skip any existing --port arguments to avoid conflicts
+        if (args[i] == "--port") {
+            i++; // Skip the port value too
+            continue;
+        }
+        command_line += " " + args[i];
+    }
+    
+    STARTUPINFO si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+    
+    // Try to start the server process
+    if (!CreateProcess(NULL, const_cast<char*>(command_line.c_str()), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        return false;
+    }
+    
+    server_process = pi.hProcess;
+    CloseHandle(pi.hThread); // We don't need the thread handle
+    return true;
+#else
+    // Unix implementation using fork/exec
+    server_process = fork();
+    
+    if (server_process == -1) {
         perror("fork failed");
         return false;
     }
     
-    if (server_pid == 0) {
+    if (server_process == 0) {
         // Child process - execute llama-server
         std::vector<std::string> server_args_vec;
         server_args_vec.push_back("llama-server");
@@ -261,12 +323,13 @@ static bool start_server(const std::vector<std::string> & args, int port) {
     }
     
     return true;
+#endif
 }
 
 // Wait for server to be ready, timeout is not excessive as we could be
 // downloading a model
 static bool wait_for_server(HttpClient & client, int max_wait_seconds = 3000) {
-    std::cout << "Starting llama-server..." << std::flush;
+    LOG_INF("Starting llama-server...");
     
     for (int i = 0; i < max_wait_seconds; ++i) {
         if (should_exit.load()) {
@@ -274,22 +337,22 @@ static bool wait_for_server(HttpClient & client, int max_wait_seconds = 3000) {
         }
         
         if (client.is_server_ready()) {
-            std::cout << " ready!\n";
+            LOG_INF(" ready!\n");
             server_ready.store(true);
             return true;
         }
         
-        std::cout << "." << std::flush;
+        LOG_INF(".");
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     
-    std::cout << " timeout!\n";
+    LOG_INF(" timeout!\n");
     return false;
 }
 
 // Main interactive loop
 static int interactive_loop(HttpClient & client) {
-    std::cout << "\nChat with the model (Ctrl-D to quit, Ctrl-C to interrupt response):\n";
+    LOG_INF("\nChat with the model (Ctrl-D to quit, Ctrl-C to interrupt response):\n");
     
     const char* input;
     while ((input = linenoise("> ")) != nullptr && !should_exit.load()) {
@@ -304,14 +367,13 @@ static int interactive_loop(HttpClient & client) {
         // Reset interrupt flag before starting request
         interrupt_response.store(false);
         
-        std::cout << std::flush;
         std::string response = client.chat_completion(user_input);
         
         if (interrupt_response.load()) {
-            std::cout << "\n[Response interrupted - press Ctrl-D to quit]\n";
+            LOG_INF("\n[Response interrupted - press Ctrl-D to quit]\n");
             interrupt_response.store(false);
         } else {
-            std::cout << response << "\n\n";
+            LOG_INF("%s\n\n", response.c_str());
         }
     }
     
@@ -319,25 +381,25 @@ static int interactive_loop(HttpClient & client) {
 }
 
 static void print_usage(const char * program_name) {
-    std::cout << "Usage: " << program_name << " [server-options]\n";
-    std::cout << "\nThis tool starts a llama-server process and provides an interactive chat interface.\n";
-    std::cout << "All options except --port are passed through to llama-server.\n";
-    std::cout << "\nCommon options:\n";
-    std::cout << "  -h, --help                  Show this help\n";
-    std::cout << "  -m,    --model FNAME        model path (default: `models/$filename` with filename from `--hf-file`\n";
-    std::cout << "                              or `--model-url` if set, otherwise models/7B/ggml-model-f16.gguf)\n";
-    std::cout << "  -hf,   -hfr, --hf-repo      <user>/<model>[:quant]\n";
-    std::cout << "                              Hugging Face model repository; quant is optional, case-insensitive,\n";
-    std::cout << "                              default to Q4_K_M, or falls back to the first file in the repo if\n";
-    std::cout << "                              Q4_K_M doesn't exist.\n";
-    std::cout << "                              mmproj is also downloaded automatically if available. to disable, add\n";
-    std::cout << "                              --no-mmproj\n";
-    std::cout << "                              example: unsloth/phi-4-GGUF:q4_k_m\n";
-    std::cout << "                              (default: unused)\n";
-    std::cout << "  -c, --ctx-size N            Context size\n";
-    std::cout << "  -n, --predict N             Number of tokens to predict\n";
-    std::cout << "  -t, --threads N             Number of threads\n";
-    std::cout << "\nFor all server options, run: llama-server --help\n";
+    LOG_INF("Usage: %s [server-options]\n", program_name);
+    LOG_INF("\nThis tool starts a llama-server process and provides an interactive chat interface.\n");
+    LOG_INF("All options except --port are passed through to llama-server.\n");
+    LOG_INF("\nCommon options:\n");
+    LOG_INF("  -h, --help                  Show this help\n");
+    LOG_INF("  -m,    --model FNAME        model path (default: `models/$filename` with filename from `--hf-file`\n");
+    LOG_INF("                              or `--model-url` if set, otherwise models/7B/ggml-model-f16.gguf)\n");
+    LOG_INF("  -hf,   -hfr, --hf-repo      <user>/<model>[:quant]\n");
+    LOG_INF("                              Hugging Face model repository; quant is optional, case-insensitive,\n");
+    LOG_INF("                              default to Q4_K_M, or falls back to the first file in the repo if\n");
+    LOG_INF("                              Q4_K_M doesn't exist.\n");
+    LOG_INF("                              mmproj is also downloaded automatically if available. to disable, add\n");
+    LOG_INF("                              --no-mmproj\n");
+    LOG_INF("                              example: unsloth/phi-4-GGUF:q4_k_m\n");
+    LOG_INF("                              (default: unused)\n");
+    LOG_INF("  -c, --ctx-size N            Context size\n");
+    LOG_INF("  -n, --predict N             Number of tokens to predict\n");
+    LOG_INF("  -t, --threads N             Number of threads\n");
+    LOG_INF("\nFor all server options, run: llama-server --help\n");
 }
 
 int main(int argc, char** argv) {
@@ -358,8 +420,10 @@ int main(int argc, char** argv) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     
     // Setup signal handlers
+#if !defined(_WIN32)
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigterm_handler);
+#endif
     
     // Convert args to vector
     std::vector<std::string> args;
@@ -371,6 +435,29 @@ int main(int argc, char** argv) {
     int port = 8080;
     for (int i = 0; i < 100; ++i) {
         // Simple check if port is available by trying to bind
+#if defined(_WIN32)
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            port++;
+            continue;
+        }
+        
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock != INVALID_SOCKET) {
+            struct sockaddr_in addr;
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(port);
+            addr.sin_addr.s_addr = INADDR_ANY;
+            
+            if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                closesocket(sock);
+                WSACleanup();
+                break; // Port is available
+            }
+            closesocket(sock);
+        }
+        WSACleanup();
+#else
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock >= 0) {
             struct sockaddr_in addr;
@@ -384,12 +471,13 @@ int main(int argc, char** argv) {
             }
             close(sock);
         }
+#endif
         port++;
     }
     
     // Start server
     if (!start_server(args, port)) {
-        std::cerr << "Failed to start llama-server\n";
+        LOG_ERR("Failed to start llama-server\n");
         return 1;
     }
     
@@ -398,7 +486,7 @@ int main(int argc, char** argv) {
     
     // Wait for server to be ready
     if (!wait_for_server(client)) {
-        std::cerr << "Server failed to start in time\n";
+        LOG_ERR("Server failed to start in time\n");
         return cleanup_and_exit(1);
     }
     
@@ -410,7 +498,7 @@ int main(int argc, char** argv) {
 }
 #else
 int main(int argc, char** argv) {
-    std::cerr << "Error: llama-run requires CURL support enabled.\n";
+    LOG_ERR("Error: llama-run requires CURL support enabled.\n");
     return 1;
 }
 #endif
