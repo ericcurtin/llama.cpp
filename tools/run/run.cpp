@@ -14,6 +14,9 @@
 #include <chrono>
 #include <cstring>
 #include <cassert>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #if defined(LLAMA_USE_CURL)
 #include <curl/curl.h>
@@ -59,19 +62,21 @@ public:
         if (!curl) return false;
         
         response_data.clear();
-        std::string url = base_url + "/health";
+        // Try the models endpoint instead of health
+        std::string url = base_url + "/v1/models";
         
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 1L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 2L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 1L);
         
         CURLcode res = curl_easy_perform(curl);
-        return res == CURLE_OK;
+        return res == CURLE_OK && !response_data.empty();
     }
 
     std::string chat_completion(const std::string& message) {
-        if (!curl) return "";
+        if (!curl) return "Error: HTTP client not initialized";
         
         response_data.clear();
         std::string url = base_url + "/v1/chat/completions";
@@ -89,7 +94,8 @@ public:
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
         
         interrupt_response.store(false);
         CURLcode res = curl_easy_perform(curl);
@@ -97,7 +103,17 @@ public:
         curl_slist_free_all(headers);
         
         if (res != CURLE_OK) {
-            return "Error: Failed to communicate with server";
+            if (res == CURLE_OPERATION_TIMEDOUT) {
+                return "Error: Request timed out";
+            } else if (res == CURLE_COULDNT_CONNECT) {
+                return "Error: Could not connect to server";
+            } else {
+                return "Error: " + std::string(curl_easy_strerror(res));
+            }
+        }
+        
+        if (interrupt_response.load()) {
+            return ""; // Empty response for interrupted requests
         }
         
         // Simple JSON parsing to extract content
@@ -170,13 +186,8 @@ private:
 // Signal handlers
 void sigint_handler(int sig) {
     (void)sig;
-    if (server_ready.load()) {
-        interrupt_response.store(true);
-        std::cout << "\n^C (Use Ctrl-D to quit)\n";
-        // Note: Cannot force refresh from signal handler safely
-    } else {
-        should_exit.store(true);
-    }
+    // Set flag to interrupt response, but don't print here
+    interrupt_response.store(true);
 }
 
 void cleanup_and_exit(int exit_code) {
@@ -282,11 +293,14 @@ int interactive_loop(HttpClient& client) {
             continue;
         }
         
+        // Reset interrupt flag before starting request
+        interrupt_response.store(false);
+        
         std::cout << std::flush;
         std::string response = client.chat_completion(user_input);
         
         if (interrupt_response.load()) {
-            std::cout << "\n[Response interrupted]\n";
+            std::cout << "\n[Response interrupted - press Ctrl-D to quit]\n";
             interrupt_response.store(false);
         } else {
             std::cout << response << "\n\n";
@@ -342,8 +356,25 @@ int main(int argc, char** argv) {
         args.push_back(argv[i]);
     }
     
-    // Find a free port (simple approach - use fixed port for now)
+    // Find a free port (start from 8080 and increment)
     int port = 8080;
+    for (int i = 0; i < 100; ++i) {
+        // Simple check if port is available by trying to bind
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock >= 0) {
+            struct sockaddr_in addr;
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(port);
+            addr.sin_addr.s_addr = INADDR_ANY;
+            
+            if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                close(sock);
+                break; // Port is available
+            }
+            close(sock);
+        }
+        port++;
+    }
     
     // Start server
     if (!start_server(args, port)) {
