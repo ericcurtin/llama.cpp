@@ -1,208 +1,196 @@
 #include "log.h"
+#include "arg.h"
+#include "common.h"
+#include "llama.h"
 
 #include <iostream>
 #include <string>
 #include <vector>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <fcntl.h>
-#include <cerrno>
-#include <cstdlib>
-#include <sstream>
 #include <memory>
 #include <atomic>
-#include <thread>
-#include <chrono>
 #include <cstring>
-#include <cassert>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-
-#if defined(LLAMA_USE_CURL)
-#include <curl/curl.h>
+#include <signal.h>
 
 #include "linenoise.cpp/linenoise.h"
 
 // Global variables for process management
-static pid_t server_pid = -1;
-static std::atomic<bool> server_ready{false};
 static std::atomic<bool> should_exit{false};
-static std::atomic<bool> interrupt_response{false};
 
-// HTTP client for communicating with llama-server
-class HttpClient {
+// Direct llama.cpp integration class
+class LlamaRunner {
 private:
-    CURL* curl;
-    std::string response_data;
-    std::string base_url;
-
-    static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
-        if (interrupt_response.load()) {
-            return 0; // Stop the transfer
-        }
-        size_t realsize = size * nmemb;
-        userp->append((char*)contents, realsize);
-        return realsize;
-    }
+    llama_model* model = nullptr;
+    llama_context* ctx = nullptr;
+    const llama_vocab* vocab = nullptr;
+    llama_sampler* smpl = nullptr;
+    std::vector<llama_chat_message> messages;
+    std::vector<char> formatted;
+    int prev_len = 0;
 
 public:
-    HttpClient(const std::string& host, int port) {
-        curl = curl_easy_init();
-        base_url = "http://" + host + ":" + std::to_string(port);
-    }
-
-    ~HttpClient() {
-        if (curl) {
-            curl_easy_cleanup(curl);
-        }
-    }
-
-    bool is_server_ready() {
-        if (!curl) return false;
-        
-        response_data.clear();
-        // Try the models endpoint instead of health
-        std::string url = base_url + "/v1/models";
-        
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 2L);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 1L);
-        
-        CURLcode res = curl_easy_perform(curl);
-        return res == CURLE_OK && !response_data.empty();
-    }
-
-    std::string chat_completion(const std::string& message) {
-        if (!curl) return "Error: HTTP client not initialized";
-        
-        response_data.clear();
-        std::string url = base_url + "/v1/chat/completions";
-        
-        // Create simple JSON request string
-        std::string escaped_message = escape_json_string(message);
-        std::string request_str = R"({"model": "unknown", "messages": [{"role": "user", "content": ")" 
-                                + escaped_message + R"("}], "stream": false})";
-        
-        struct curl_slist* headers = nullptr;
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-        
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_str.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-        
-        interrupt_response.store(false);
-        CURLcode res = curl_easy_perform(curl);
-        
-        curl_slist_free_all(headers);
-        
-        if (res != CURLE_OK) {
-            if (res == CURLE_OPERATION_TIMEDOUT) {
-                return "Error: Request timed out";
-            } else if (res == CURLE_COULDNT_CONNECT) {
-                return "Error: Could not connect to server";
-            } else {
-                return "Error: " + std::string(curl_easy_strerror(res));
-            }
+    LlamaRunner() = default;
+    
+    ~LlamaRunner() {
+        // free resources
+        for (auto& msg : messages) {
+            free(const_cast<char*>(msg.content));
         }
         
-        if (interrupt_response.load()) {
-            return ""; // Empty response for interrupted requests
+        if (smpl) llama_sampler_free(smpl);
+        if (ctx) llama_free(ctx);
+        if (model) llama_model_free(model);
+    }
+
+    bool initialize(const common_params& params) {
+        // initialize the model
+        llama_model_params model_params = llama_model_default_params();
+        model_params.n_gpu_layers = params.n_gpu_layers;
+
+        model = llama_model_load_from_file(params.model.path.c_str(), model_params);
+        if (model == nullptr) {
+            LOG_ERR("unable to load model from '%s'\n", params.model.path.c_str());
+            return false;
+        }
+
+        vocab = llama_model_get_vocab(model);
+
+        // initialize the context
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = params.n_ctx;
+        ctx_params.n_batch = params.n_batch;
+        ctx_params.no_perf = false;
+
+        ctx = llama_init_from_model(model, ctx_params);
+        if (ctx == nullptr) {
+            LOG_ERR("failed to create the llama_context\n");
+            return false;
+        }
+
+        // initialize the sampler
+        auto sparams = llama_sampler_chain_default_params();
+        sparams.no_perf = false;
+        smpl = llama_sampler_chain_init(sparams);
+
+        // Configure sampling based on params
+        if (params.sampling.temp > 0.0f) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_temp(params.sampling.temp));
+        }
+        if (params.sampling.top_k > 0) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_k(params.sampling.top_k));
+        }
+        if (params.sampling.top_p < 1.0f) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_p(params.sampling.top_p, 1));
         }
         
-        // Simple JSON parsing to extract content
-        return extract_content_from_response(response_data);
+        llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+
+        // Prepare formatted buffer
+        formatted.resize(llama_n_ctx(ctx));
+
+        return true;
+    }
+
+    std::string generate_response(const std::string& user_input) {
+        if (!model || !ctx || !smpl) {
+            return "Error: Model not initialized";
+        }
+
+        const char* tmpl = llama_model_chat_template(model, nullptr);
+        if (!tmpl) {
+            return "Error: No chat template available";
+        }
+
+        // Add the user input to the message list and format it
+        messages.push_back({"user", strdup(user_input.c_str())});
+        int new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, formatted.data(), formatted.size());
+        
+        if (new_len > (int)formatted.size()) {
+            formatted.resize(new_len);
+            new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, formatted.data(), formatted.size());
+        }
+        
+        if (new_len < 0) {
+            return "Error: Failed to apply chat template";
+        }
+
+        // Remove previous messages to obtain the prompt to generate the response
+        std::string prompt(formatted.begin() + prev_len, formatted.begin() + new_len);
+
+        // Generate response
+        std::string response = generate(prompt);
+
+        // Add the response to the messages
+        messages.push_back({"assistant", strdup(response.c_str())});
+        prev_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), false, nullptr, 0);
+        
+        return response;
     }
 
 private:
-    std::string escape_json_string(const std::string& input) {
-        std::string result;
-        for (char c : input) {
-            switch (c) {
-                case '"': result += "\\\""; break;
-                case '\\': result += "\\\\"; break;
-                case '\n': result += "\\n"; break;
-                case '\r': result += "\\r"; break;
-                case '\t': result += "\\t"; break;
-                default: result += c; break;
+    std::string generate(const std::string& prompt) {
+        if (prompt.empty()) {
+            return "";
+        }
+
+        std::string response;
+        const bool is_first = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == -1;
+
+        // Tokenize the prompt
+        const int n_prompt_tokens = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), nullptr, 0, is_first, true);
+        std::vector<llama_token> prompt_tokens(n_prompt_tokens);
+        
+        if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), is_first, true) < 0) {
+            return "Error: Failed to tokenize prompt";
+        }
+
+        // Prepare a batch for the prompt
+        llama_batch batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
+        llama_token new_token_id;
+        
+        while (!should_exit.load()) {
+            // Check if we have enough space in the context
+            int n_ctx_max = llama_n_ctx(ctx);
+            int n_ctx_used = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+            
+            if (n_ctx_used + batch.n_tokens > n_ctx_max) {
+                return response + "\n[Context limit reached]";
             }
-        }
-        return result;
-    }
-    
-    std::string extract_content_from_response(const std::string& response) {
-        // Simple extraction of content from JSON response
-        // Look for "content":"..." pattern
-        size_t content_pos = response.find("\"content\":\"");
-        if (content_pos == std::string::npos) {
-            return "Error: No content found in response";
-        }
-        
-        content_pos += 11; // Skip "content":"
-        size_t end_pos = content_pos;
-        
-        // Find the end of the content string, handling escaped quotes
-        while (end_pos < response.length()) {
-            if (response[end_pos] == '"' && (end_pos == content_pos || response[end_pos - 1] != '\\')) {
+
+            int ret = llama_decode(ctx, batch);
+            if (ret != 0) {
+                return response + "\n[Decode error]";
+            }
+
+            // Sample the next token
+            new_token_id = llama_sampler_sample(smpl, ctx, -1);
+
+            // Is it an end of generation?
+            if (llama_vocab_is_eog(vocab, new_token_id)) {
                 break;
             }
-            end_pos++;
-        }
-        
-        if (end_pos >= response.length()) {
-            return "Error: Malformed response";
-        }
-        
-        std::string content = response.substr(content_pos, end_pos - content_pos);
-        return unescape_json_string(content);
-    }
-    
-    std::string unescape_json_string(const std::string& input) {
-        std::string result;
-        for (size_t i = 0; i < input.length(); ++i) {
-            if (input[i] == '\\' && i + 1 < input.length()) {
-                switch (input[i + 1]) {
-                    case '"': result += '"'; i++; break;
-                    case '\\': result += '\\'; i++; break;
-                    case 'n': result += '\n'; i++; break;
-                    case 'r': result += '\r'; i++; break;
-                    case 't': result += '\t'; i++; break;
-                    default: result += input[i]; break;
-                }
-            } else {
-                result += input[i];
+
+            // Convert token to string
+            char buf[256];
+            int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
+            if (n < 0) {
+                return response + "\n[Token conversion error]";
             }
+            
+            std::string piece(buf, n);
+            response += piece;
+
+            // Prepare the next batch with the sampled token
+            batch = llama_batch_get_one(&new_token_id, 1);
         }
-        return result;
+
+        return response;
     }
 };
 
 // Signal handlers
 static void sigint_handler(int sig) {
     (void)sig;
-    // Set flag to interrupt response, but don't print here
-    interrupt_response.store(true);
-}
-
-static int cleanup_and_exit(int exit_code) {
-    if (server_pid > 0) {
-        if (kill(server_pid, SIGTERM) == -1) {
-            LOG_ERR("kill failed");
-        }
-
-        if (waitpid(server_pid, nullptr, 0) == -1) {
-            LOG_ERR("waitpid failed");
-        }
-    }
-
-    return exit_code;
+    should_exit.store(true);
 }
 
 static void sigterm_handler(int sig) {
@@ -210,106 +198,26 @@ static void sigterm_handler(int sig) {
     should_exit.store(true);
 }
 
-// Start llama-server process
-static bool start_server(const std::vector<std::string> & args, int port) {
-    server_pid = fork();
-    
-    if (server_pid == -1) {
-        perror("fork failed");
-        return false;
-    }
-    
-    if (server_pid == 0) {
-        // Child process - execute llama-server
-        std::vector<std::string> server_args_vec;
-        server_args_vec.push_back("llama-server");
-        
-        // Add custom port
-        server_args_vec.push_back("--port");
-        server_args_vec.push_back(std::to_string(port));
-        
-        // Add all original arguments except the program name
-        for (size_t i = 1; i < args.size(); ++i) {
-            // Skip any existing --port arguments to avoid conflicts
-            if (args[i] == "--port") {
-                i++; // Skip the port value too
-                continue;
-            }
-            server_args_vec.push_back(args[i]);
-        }
-        
-        // Convert to char* array for execvp
-        std::vector<char*> server_args;
-        for (const auto& arg : server_args_vec) {
-            server_args.push_back(const_cast<char*>(arg.c_str()));
-        }
-        server_args.push_back(nullptr);
-        
-        // Try different paths for llama-server
-        std::vector<std::string> server_paths = {
-            "./build/bin/llama-server",
-            "./llama-server",
-            "llama-server"
-        };
-        
-        for (const auto& path : server_paths) {
-            execvp(path.c_str(), server_args.data());
-        }
-        
-        perror("Failed to execute llama-server");
-        exit(1);
-    }
-    
-    return true;
-}
-
-// Wait for server to be ready, timeout is not excessive as we could be
-// downloading a model
-static bool wait_for_server(HttpClient & client, int max_wait_seconds = 3000) {
-    std::cout << "Starting llama-server..." << std::flush;
-    
-    for (int i = 0; i < max_wait_seconds; ++i) {
-        if (should_exit.load()) {
-            return false;
-        }
-        
-        if (client.is_server_ready()) {
-            std::cout << " ready!\n";
-            server_ready.store(true);
-            return true;
-        }
-        
-        std::cout << "." << std::flush;
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-    
-    std::cout << " timeout!\n";
-    return false;
-}
-
 // Main interactive loop
-static int interactive_loop(HttpClient & client) {
-    std::cout << "\nChat with the model (Ctrl-D to quit, Ctrl-C to interrupt response):\n";
+static int interactive_loop(LlamaRunner& runner) {
+    std::cout << "\nChat with the model (Ctrl-D to quit, Ctrl-C to exit):\n";
     
     const char* input;
     while ((input = linenoise("> ")) != nullptr && !should_exit.load()) {
         std::string user_input(input);
         linenoiseHistoryAdd(input);
-        linenoiseFree(const_cast<char*>(input)); // linenoiseFree expects char*
+        linenoiseFree(const_cast<char*>(input));
         
         if (user_input.empty()) {
             continue;
         }
         
-        // Reset interrupt flag before starting request
-        interrupt_response.store(false);
-        
         std::cout << std::flush;
-        std::string response = client.chat_completion(user_input);
+        std::string response = runner.generate_response(user_input);
         
-        if (interrupt_response.load()) {
-            std::cout << "\n[Response interrupted - press Ctrl-D to quit]\n";
-            interrupt_response.store(false);
+        if (should_exit.load()) {
+            std::cout << "\n[Interrupted]\n";
+            break;
         } else {
             std::cout << response << "\n\n";
         }
@@ -319,98 +227,129 @@ static int interactive_loop(HttpClient & client) {
 }
 
 static void print_usage(const char * program_name) {
-    std::cout << "Usage: " << program_name << " [server-options]\n";
-    std::cout << "\nThis tool starts a llama-server process and provides an interactive chat interface.\n";
-    std::cout << "All options except --port are passed through to llama-server.\n";
+    std::cout << "Usage: " << program_name << " [options]\n";
+    std::cout << "\nThis tool provides an interactive chat interface using llama.cpp directly.\n";
     std::cout << "\nCommon options:\n";
     std::cout << "  -h, --help                  Show this help\n";
-    std::cout << "  -m,    --model FNAME        model path (default: `models/$filename` with filename from `--hf-file`\n";
-    std::cout << "                              or `--model-url` if set, otherwise models/7B/ggml-model-f16.gguf)\n";
-    std::cout << "  -hf,   -hfr, --hf-repo      <user>/<model>[:quant]\n";
-    std::cout << "                              Hugging Face model repository; quant is optional, case-insensitive,\n";
-    std::cout << "                              default to Q4_K_M, or falls back to the first file in the repo if\n";
-    std::cout << "                              Q4_K_M doesn't exist.\n";
-    std::cout << "                              mmproj is also downloaded automatically if available. to disable, add\n";
-    std::cout << "                              --no-mmproj\n";
-    std::cout << "                              example: unsloth/phi-4-GGUF:q4_k_m\n";
-    std::cout << "                              (default: unused)\n";
-    std::cout << "  -c, --ctx-size N            Context size\n";
-    std::cout << "  -n, --predict N             Number of tokens to predict\n";
+    std::cout << "  -m,    --model FNAME        model path (required)\n";
+    std::cout << "  -c, --ctx-size N            Context size (default: 2048)\n";
+    std::cout << "  -n, --predict N             Number of tokens to predict (default: -1, unlimited)\n";
     std::cout << "  -t, --threads N             Number of threads\n";
-    std::cout << "\nFor all server options, run: llama-server --help\n";
+    std::cout << "  -ngl, --n-gpu-layers N      Number of layers to offload to GPU (default: 99)\n";
+    std::cout << "  --temp N                    Temperature for sampling (default: 0.8)\n";
+    std::cout << "  --top-k N                   Top-k sampling (default: 40)\n";
+    std::cout << "  --top-p N                   Top-p sampling (default: 0.9)\n";
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
+    // Parse arguments using common_params
+    common_params params;
+    
+    // Set defaults
+    params.n_ctx = 2048;
+    params.n_predict = -1; // unlimited
+    params.n_gpu_layers = 99;
+    params.sampling.temp = 0.8f;
+    params.sampling.top_k = 40;
+    params.sampling.top_p = 0.9f;
+    
+    // Simple argument parsing
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            return 0;
+        } else if (arg == "-m" || arg == "--model") {
+            if (i + 1 < argc) {
+                params.model.path = argv[++i];
+            } else {
+                std::cerr << "Error: --model requires a value\n";
+                return 1;
+            }
+        } else if (arg == "-c" || arg == "--ctx-size") {
+            if (i + 1 < argc) {
+                params.n_ctx = std::stoi(argv[++i]);
+            } else {
+                std::cerr << "Error: --ctx-size requires a value\n";
+                return 1;
+            }
+        } else if (arg == "-n" || arg == "--predict") {
+            if (i + 1 < argc) {
+                params.n_predict = std::stoi(argv[++i]);
+            } else {
+                std::cerr << "Error: --predict requires a value\n";
+                return 1;
+            }
+        } else if (arg == "-t" || arg == "--threads") {
+            if (i + 1 < argc) {
+                params.cpuparams.n_threads = std::stoi(argv[++i]);
+            } else {
+                std::cerr << "Error: --threads requires a value\n";
+                return 1;
+            }
+        } else if (arg == "-ngl" || arg == "--n-gpu-layers") {
+            if (i + 1 < argc) {
+                params.n_gpu_layers = std::stoi(argv[++i]);
+            } else {
+                std::cerr << "Error: --n-gpu-layers requires a value\n";
+                return 1;
+            }
+        } else if (arg == "--temp") {
+            if (i + 1 < argc) {
+                params.sampling.temp = std::stof(argv[++i]);
+            } else {
+                std::cerr << "Error: --temp requires a value\n";
+                return 1;
+            }
+        } else if (arg == "--top-k") {
+            if (i + 1 < argc) {
+                params.sampling.top_k = std::stoi(argv[++i]);
+            } else {
+                std::cerr << "Error: --top-k requires a value\n";
+                return 1;
+            }
+        } else if (arg == "--top-p") {
+            if (i + 1 < argc) {
+                params.sampling.top_p = std::stof(argv[++i]);
+            } else {
+                std::cerr << "Error: --top-p requires a value\n";
+                return 1;
+            }
+        } else {
+            std::cerr << "Error: Unknown argument '" << arg << "'\n";
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+    
+    if (params.model.path.empty()) {
+        std::cerr << "Error: Model path is required (-m/--model)\n";
         print_usage(argv[0]);
         return 1;
     }
     
-    // Check for help
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") {
-            print_usage(argv[0]);
-            return 0;
-        }
-    }
-    
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    // Load dynamic backends
+    ggml_backend_load_all();
     
     // Setup signal handlers
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigterm_handler);
     
-    // Convert args to vector
-    std::vector<std::string> args;
-    for (int i = 0; i < argc; ++i) {
-        args.push_back(argv[i]);
-    }
+    // Initialize llama runner
+    LlamaRunner runner;
     
-    // Find a free port (start from 8080 and increment)
-    int port = 8080;
-    for (int i = 0; i < 100; ++i) {
-        // Simple check if port is available by trying to bind
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock >= 0) {
-            struct sockaddr_in addr;
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(port);
-            addr.sin_addr.s_addr = INADDR_ANY;
-            
-            if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-                close(sock);
-                break; // Port is available
-            }
-            close(sock);
-        }
-        port++;
-    }
+    std::cout << "Loading model '" << params.model.path << "'...\n";
     
-    // Start server
-    if (!start_server(args, port)) {
-        std::cerr << "Failed to start llama-server\n";
+    if (!runner.initialize(params)) {
+        std::cerr << "Failed to initialize model\n";
         return 1;
     }
     
-    // Create HTTP client
-    HttpClient client("127.0.0.1", port);
-    
-    // Wait for server to be ready
-    if (!wait_for_server(client)) {
-        std::cerr << "Server failed to start in time\n";
-        return cleanup_and_exit(1);
-    }
+    std::cout << "Model loaded successfully!\n";
     
     // Start interactive loop
-    int result = interactive_loop(client);
+    int result = interactive_loop(runner);
     
-    // Cleanup
-    return cleanup_and_exit(result);
+    return result;
 }
-#else
-int main(int argc, char** argv) {
-    std::cerr << "Error: llama-run requires CURL support enabled.\n";
-    return 1;
-}
-#endif
