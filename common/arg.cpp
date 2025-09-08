@@ -484,6 +484,11 @@ static bool common_download_file_multiple(const std::vector<std::pair<std::strin
     return true;
 }
 
+// Forward declaration for Docker blob download function
+static bool common_docker_download_blob(const std::string & blob_url,
+                                        const std::string & token,
+                                        const std::string & local_path);
+
 static bool common_download_model(
         const common_params_model & model,
         const std::string & bearer_token,
@@ -492,6 +497,26 @@ static bool common_download_model(
     if (model.url.empty()) {
         LOG_ERR("%s: invalid model url\n", __func__);
         return false;
+    }
+
+    // Check if this is a Docker blob URL and handle it specially
+    if (model.url.find("registry-1.docker.io/v2/") != std::string::npos && 
+        model.url.find("/blobs/") != std::string::npos) {
+        // Extract repo from the blob URL: https://registry-1.docker.io/v2/{repo}/blobs/{digest}
+        std::string url_copy = model.url;
+        size_t repo_start = url_copy.find("/v2/") + 4;
+        size_t repo_end = url_copy.find("/blobs/");
+        if (repo_start != std::string::npos && repo_end != std::string::npos && repo_end > repo_start) {
+            std::string repo = url_copy.substr(repo_start, repo_end - repo_start);
+            try {
+                // Get Docker token for this repository
+                std::string docker_token = common_docker_get_token(repo);
+                return common_docker_download_blob(model.url, docker_token, model.path);
+            } catch (const std::exception & e) {
+                LOG_ERR("%s: failed to download Docker blob: %s\n", __func__, e.what());
+                return false;
+            }
+        }
     }
 
     if (!common_download_file_single(model.url, model.path, bearer_token, offline)) {
@@ -970,6 +995,87 @@ struct handle_model_result {
     common_params_model mmproj;
 };
 
+// Helper structure to hold Docker URL parsing results
+struct docker_url_info {
+    std::string repo;
+    std::string tag;
+    bool is_docker_url = false;
+};
+
+// Parse docker:// URLs and extract repo and tag information
+static docker_url_info parse_docker_url(const std::string & url) {
+    docker_url_info info;
+    
+    if (url.length() > 9 && url.substr(0, 9) == "docker://") {
+        info.is_docker_url = true;
+        std::string model_spec = url.substr(9);  // Remove "docker://"
+        
+        // Parse ai/smollm2:135M-Q4_K_M
+        size_t colon_pos = model_spec.find(':');
+        if (colon_pos != std::string::npos) {
+            info.repo = model_spec.substr(0, colon_pos);
+            info.tag = model_spec.substr(colon_pos + 1);
+        } else {
+            info.repo = model_spec;
+            info.tag = "latest";
+        }
+    }
+    
+    return info;
+}
+
+// Helper function to get Docker blob URL for downloading
+// Returns the blob URL and token needed for downloading
+static std::pair<std::string, std::string> get_docker_blob_url(const std::string & repo, const std::string & tag, bool offline) {
+    if (offline) {
+        throw std::runtime_error("Docker model download not available in offline mode");
+    }
+
+    try {
+        std::string token = common_docker_get_token(repo);
+
+        // Get manifest
+        std::string          manifest_url = "https://registry-1.docker.io/v2/" + repo + "/manifests/" + tag;
+        common_remote_params manifest_params;
+        manifest_params.headers.push_back("Authorization: Bearer " + token);
+        manifest_params.headers.push_back(
+            "Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json");
+        auto manifest_res = common_remote_get_content(manifest_url, manifest_params);
+        if (manifest_res.first != 200) {
+            throw std::runtime_error("Failed to get Docker manifest, HTTP code: " + std::to_string(manifest_res.first));
+        }
+
+        std::string            manifest_str(manifest_res.second.begin(), manifest_res.second.end());
+        nlohmann::ordered_json manifest = nlohmann::ordered_json::parse(manifest_str);
+        std::string            gguf_digest;
+        
+        // Find the GGUF layer
+        if (manifest.contains("layers")) {
+            for (const auto & layer : manifest["layers"]) {
+                if (layer.contains("mediaType")) {
+                    std::string media_type = layer["mediaType"].get<std::string>();
+                    if (media_type == "application/vnd.docker.ai.gguf.v3" ||
+                        media_type.find("gguf") != std::string::npos) {
+                        gguf_digest = layer["digest"].get<std::string>();
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (gguf_digest.empty()) {
+            throw std::runtime_error("No GGUF layer found in Docker manifest");
+        }
+
+        // Return blob URL and token
+        std::string blob_url = "https://registry-1.docker.io/v2/" + repo + "/blobs/" + gguf_digest;
+        return {blob_url, token};
+    } catch (const std::exception & e) {
+        LOG_ERR("Failed to get Docker blob URL: %s\n", e.what());
+        throw;
+    }
+}
+
 static handle_model_result common_params_handle_model(
         struct common_params_model & model,
         const std::string & bearer_token,
@@ -1009,15 +1115,44 @@ static handle_model_result common_params_handle_model(
                 model.path = fs_get_cache_file(filename);
             }
 
-        } else if (!model.url.empty()) {
-            if (model.path.empty()) {
-                auto f = string_split<std::string>(model.url, '#').front();
-                f = string_split<std::string>(f, '?').front();
-                model.path = fs_get_cache_file(string_split<std::string>(f, '/').back());
-            }
+        } else {
+            // Check if model.path contains a docker:// URL
+            auto docker_info = parse_docker_url(model.path);
+            if (docker_info.is_docker_url) {
+                LOG_INF("Resolving Docker model: %s:%s\n", docker_info.repo.c_str(), docker_info.tag.c_str());
+                
+                // Generate cache filename similar to Docker resolve logic
+                std::string model_filename = docker_info.repo;
+                std::replace(model_filename.begin(), model_filename.end(), '/', '_');
+                model_filename += "_" + docker_info.tag + ".gguf";
+                std::string local_path = fs_get_cache_file(model_filename);
+                
+                // Check if already cached
+                if (std::filesystem::exists(local_path)) {
+                    LOG_INF("Docker model already cached: %s\n", local_path.c_str());
+                    model.path = local_path;
+                    model.url = ""; // Clear URL since we have local file
+                } else {
+                    // Get Docker blob URL and set up for download
+                    try {
+                        auto [blob_url, token] = get_docker_blob_url(docker_info.repo, docker_info.tag, offline);
+                        model.url = blob_url;
+                        model.path = local_path;
+                    } catch (const std::exception & e) {
+                        LOG_ERR("Failed to resolve Docker model: %s\n", e.what());
+                        exit(1);
+                    }
+                }
+            } else if (!model.url.empty()) {
+                if (model.path.empty()) {
+                    auto f = string_split<std::string>(model.url, '#').front();
+                    f = string_split<std::string>(f, '?').front();
+                    model.path = fs_get_cache_file(string_split<std::string>(f, '/').back());
+                }
 
-        } else if (model.path.empty()) {
-            model.path = model_path_default;
+            } else if (model.path.empty()) {
+                model.path = model_path_default;
+            }
         }
     }
 

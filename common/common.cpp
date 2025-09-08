@@ -901,13 +901,10 @@ struct common_init_result common_init_from_params(common_params & params) {
     common_init_result iparams;
     auto mparams = common_model_params_to_llama(params);
 
-    // Resolve Docker URLs if needed
-    std::string resolved_model_path = common_docker_resolve_model(params.model.path);
-
-    llama_model * model = llama_model_load_from_file(resolved_model_path.c_str(), mparams);
+    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         LOG_ERR("%s: failed to load model '%s', try reducing --n-gpu-layers if you're running out of VRAM\n",
-            __func__, resolved_model_path.c_str());
+            __func__, params.model.path.c_str());
         return iparams;
     }
 
@@ -918,7 +915,7 @@ struct common_init_result common_init_from_params(common_params & params) {
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s', try reducing --n-gpu-layers if you're running out of VRAM\n",
-            __func__, resolved_model_path.c_str());
+            __func__, params.model.path.c_str());
         llama_model_free(model);
         return iparams;
     }
