@@ -101,7 +101,13 @@ public:
     std::pair<long, std::vector<char>> get_content(const std::string & url, 
                                                    const std::vector<std::string> & headers = {},
                                                    long timeout = 0, long max_size = 0);
-    
+
+    // Make HEAD request with header callback support
+    CurlResult head_with_headers(const std::string &              url,
+                                 const std::vector<std::string> & headers      = {},
+                                 const std::string &              bearer_token = "",
+                                 HeaderCallback                   header_cb    = nullptr);
+
     // Set custom callbacks
     void set_write_callback(WriteCallback callback);
     void set_header_callback(HeaderCallback callback);

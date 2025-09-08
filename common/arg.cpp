@@ -18,8 +18,6 @@
 #endif
 
 #define JSON_ASSERT GGML_ASSERT
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -27,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <nlohmann/json.hpp>
 #include <regex>
 #include <set>
 #include <string>
@@ -211,35 +210,35 @@ bool common_has_curl() {
 using llama_curl::curl_ptr;
 using llama_curl::curl_slist_ptr;
 
-#define CURL_MAX_RETRY 3
-#define CURL_RETRY_DELAY_SECONDS 2
+#    define CURL_MAX_RETRY           3
+#    define CURL_RETRY_DELAY_SECONDS 2
 
 // Temporary wrapper to help migration
 static bool curl_perform_with_retry(const std::string & url, CURL * curl, int max_attempts, int retry_delay_seconds, const char * method_name) {
     llama_curl::CurlClient client;
-    
+
     // Set up a basic config to use the existing CURL handle
     // This is a temporary bridge solution
     int remaining_attempts = max_attempts;
-    
+
     while (remaining_attempts > 0) {
-        LOG_INF("curl_perform_with_retry: %s %s (attempt %d of %d)...\n", 
-                method_name, url.c_str(), max_attempts - remaining_attempts + 1, max_attempts);
-        
+        LOG_INF("curl_perform_with_retry: %s %s (attempt %d of %d)...\n", method_name, url.c_str(),
+                max_attempts - remaining_attempts + 1, max_attempts);
+
         CURLcode res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
             return true;
         }
-        
+
         int exponential_backoff_delay = std::pow(retry_delay_seconds, max_attempts - remaining_attempts) * 1000;
-        LOG_WRN("curl_perform_with_retry: curl_easy_perform() failed: %s, retrying after %d milliseconds...\n", 
+        LOG_WRN("curl_perform_with_retry: curl_easy_perform() failed: %s, retrying after %d milliseconds...\n",
                 curl_easy_strerror(res), exponential_backoff_delay);
-        
+
         remaining_attempts--;
         if (remaining_attempts == 0) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(exponential_backoff_delay));
     }
-    
+
     LOG_ERR("curl_perform_with_retry: curl_easy_perform() failed after %d attempts\n", max_attempts);
     return false;
 }

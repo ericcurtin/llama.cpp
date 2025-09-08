@@ -100,6 +100,26 @@ std::pair<long, std::vector<char>> CurlClient::get_content(const std::string & u
     return { result.http_code, std::move(buffer) };
 }
 
+CurlResult CurlClient::head_with_headers(const std::string &              url,
+                                         const std::vector<std::string> & headers,
+                                         const std::string &              bearer_token,
+                                         HeaderCallback                   header_cb) {
+    // Set the header callback
+    if (header_cb) {
+        set_header_callback(header_cb);
+    }
+
+    CurlConfig config;
+    config.url                 = url;
+    config.method              = HttpMethod::HEAD;
+    config.headers             = headers;
+    config.bearer_token        = bearer_token;
+    config.max_retry_attempts  = 1;  // HEAD requests typically only retry once
+    config.retry_delay_seconds = 0;
+
+    return perform(config);
+}
+
 void CurlClient::set_write_callback(WriteCallback callback) {
     write_callback_ = callback;
 }
@@ -202,6 +222,12 @@ void CurlClient::setup_write_function(const CurlConfig & config) {
         // Use custom callback
         curl_easy_setopt(curl_.get(), CURLOPT_WRITEFUNCTION, write_callback_wrapper);
         curl_easy_setopt(curl_.get(), CURLOPT_WRITEDATA, this);
+    }
+
+    // Setup header callback if available
+    if (header_callback_) {
+        curl_easy_setopt(curl_.get(), CURLOPT_HEADERFUNCTION, header_callback_wrapper);
+        curl_easy_setopt(curl_.get(), CURLOPT_HEADERDATA, this);
     }
 }
 
