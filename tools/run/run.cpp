@@ -1,5 +1,6 @@
 #include "chat.h"
 #include "common.h"
+#include "curl.h"
 #include "llama-cpp.h"
 #include "log.h"
 

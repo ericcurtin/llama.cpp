@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdarg>
 #include <filesystem>
 #include <fstream>
@@ -206,42 +207,40 @@ bool common_has_curl() {
 // CURL utils
 //
 
-using curl_ptr = std::unique_ptr<CURL, decltype(&curl_easy_cleanup)>;
-
-// cannot use unique_ptr for curl_slist, because we cannot update without destroying the old one
-struct curl_slist_ptr {
-    struct curl_slist * ptr = nullptr;
-    ~curl_slist_ptr() {
-        if (ptr) {
-            curl_slist_free_all(ptr);
-        }
-    }
-};
+// Use the types from our common curl.h
+using llama_curl::curl_ptr;
+using llama_curl::curl_slist_ptr;
 
 #define CURL_MAX_RETRY 3
 #define CURL_RETRY_DELAY_SECONDS 2
 
+// Temporary wrapper to help migration
 static bool curl_perform_with_retry(const std::string & url, CURL * curl, int max_attempts, int retry_delay_seconds, const char * method_name) {
+    llama_curl::CurlClient client;
+    
+    // Set up a basic config to use the existing CURL handle
+    // This is a temporary bridge solution
     int remaining_attempts = max_attempts;
-
+    
     while (remaining_attempts > 0) {
-        LOG_INF("%s: %s %s (attempt %d of %d)...\n", __func__ , method_name, url.c_str(), max_attempts - remaining_attempts + 1, max_attempts);
-
+        LOG_INF("curl_perform_with_retry: %s %s (attempt %d of %d)...\n", 
+                method_name, url.c_str(), max_attempts - remaining_attempts + 1, max_attempts);
+        
         CURLcode res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
             return true;
         }
-
+        
         int exponential_backoff_delay = std::pow(retry_delay_seconds, max_attempts - remaining_attempts) * 1000;
-        LOG_WRN("%s: curl_easy_perform() failed: %s, retrying after %d milliseconds...\n", __func__, curl_easy_strerror(res), exponential_backoff_delay);
-
+        LOG_WRN("curl_perform_with_retry: curl_easy_perform() failed: %s, retrying after %d milliseconds...\n", 
+                curl_easy_strerror(res), exponential_backoff_delay);
+        
         remaining_attempts--;
         if (remaining_attempts == 0) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(exponential_backoff_delay));
     }
-
-    LOG_ERR("%s: curl_easy_perform() failed after %d attempts\n", __func__, max_attempts);
-
+    
+    LOG_ERR("curl_perform_with_retry: curl_easy_perform() failed after %d attempts\n", max_attempts);
     return false;
 }
 
