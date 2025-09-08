@@ -90,4 +90,3 @@ std::pair<long, std::vector<char>> common_remote_get_content(const std::string &
 
 // Docker registry functions
 std::string common_docker_get_token(const std::string & repo);
-std::string common_docker_resolve_model(const std::string & docker_url);
