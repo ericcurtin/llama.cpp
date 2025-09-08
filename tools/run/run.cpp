@@ -1,9 +1,9 @@
 #include "chat.h"
 #include "common.h"
+#include "curl.h"
+#include "linenoise.cpp/linenoise.h"
 #include "llama-cpp.h"
 #include "log.h"
-
-#include "linenoise.cpp/linenoise.h"
 
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>

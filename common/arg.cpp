@@ -2,6 +2,7 @@
 
 #include "chat.h"
 #include "common.h"
+#include "curl.h"
 #include "gguf.h" // for reading GGUF splits
 #include "json-schema-to-grammar.h"
 #include "log.h"
@@ -17,14 +18,14 @@
 #endif
 
 #define JSON_ASSERT GGML_ASSERT
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdarg>
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <nlohmann/json.hpp>
 #include <regex>
 #include <set>
 #include <string>
@@ -205,26 +206,24 @@ bool common_has_curl() {
 // CURL utils
 //
 
-using curl_ptr = std::unique_ptr<CURL, decltype(&curl_easy_cleanup)>;
+// Use the types from our common curl.h
+using llama_curl::curl_ptr;
+using llama_curl::curl_slist_ptr;
 
-// cannot use unique_ptr for curl_slist, because we cannot update without destroying the old one
-struct curl_slist_ptr {
-    struct curl_slist * ptr = nullptr;
-    ~curl_slist_ptr() {
-        if (ptr) {
-            curl_slist_free_all(ptr);
-        }
-    }
-};
+#    define CURL_MAX_RETRY           3
+#    define CURL_RETRY_DELAY_SECONDS 2
 
-#define CURL_MAX_RETRY 3
-#define CURL_RETRY_DELAY_SECONDS 2
-
+// Temporary wrapper to help migration
 static bool curl_perform_with_retry(const std::string & url, CURL * curl, int max_attempts, int retry_delay_seconds, const char * method_name) {
+    llama_curl::CurlClient client;
+
+    // Set up a basic config to use the existing CURL handle
+    // This is a temporary bridge solution
     int remaining_attempts = max_attempts;
 
     while (remaining_attempts > 0) {
-        LOG_INF("%s: %s %s (attempt %d of %d)...\n", __func__ , method_name, url.c_str(), max_attempts - remaining_attempts + 1, max_attempts);
+        LOG_INF("curl_perform_with_retry: %s %s (attempt %d of %d)...\n", method_name, url.c_str(),
+                max_attempts - remaining_attempts + 1, max_attempts);
 
         CURLcode res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
@@ -232,15 +231,15 @@ static bool curl_perform_with_retry(const std::string & url, CURL * curl, int ma
         }
 
         int exponential_backoff_delay = std::pow(retry_delay_seconds, max_attempts - remaining_attempts) * 1000;
-        LOG_WRN("%s: curl_easy_perform() failed: %s, retrying after %d milliseconds...\n", __func__, curl_easy_strerror(res), exponential_backoff_delay);
+        LOG_WRN("curl_perform_with_retry: curl_easy_perform() failed: %s, retrying after %d milliseconds...\n",
+                curl_easy_strerror(res), exponential_backoff_delay);
 
         remaining_attempts--;
         if (remaining_attempts == 0) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(exponential_backoff_delay));
     }
 
-    LOG_ERR("%s: curl_easy_perform() failed after %d attempts\n", __func__, max_attempts);
-
+    LOG_ERR("curl_perform_with_retry: curl_easy_perform() failed after %d attempts\n", max_attempts);
     return false;
 }
 
@@ -563,47 +562,16 @@ static bool common_download_model(
 }
 
 std::pair<long, std::vector<char>> common_remote_get_content(const std::string & url, const common_remote_params & params) {
-    curl_ptr       curl(curl_easy_init(), &curl_easy_cleanup);
-    curl_slist_ptr http_headers;
-    std::vector<char> res_buffer;
+#ifdef LLAMA_USE_CURL
+    llama_curl::CurlClient client;
+    return client.get_content(url, params.headers, params.timeout, params.max_size);
+#else
+    if (!url.empty()) {
+        throw std::runtime_error("error: built without CURL, cannot download model from the internet");
+    }
 
-    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
-    typedef size_t(*CURLOPT_WRITEFUNCTION_PTR)(void * ptr, size_t size, size_t nmemb, void * data);
-    auto write_callback = [](void * ptr, size_t size, size_t nmemb, void * data) -> size_t {
-        auto data_vec = static_cast<std::vector<char> *>(data);
-        data_vec->insert(data_vec->end(), (char *)ptr, (char *)ptr + size * nmemb);
-        return size * nmemb;
-    };
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, static_cast<CURLOPT_WRITEFUNCTION_PTR>(write_callback));
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &res_buffer);
-#if defined(_WIN32)
-    curl_easy_setopt(curl.get(), CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+    return {};
 #endif
-    if (params.timeout > 0) {
-        curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, params.timeout);
-    }
-    if (params.max_size > 0) {
-        curl_easy_setopt(curl.get(), CURLOPT_MAXFILESIZE, params.max_size);
-    }
-    http_headers.ptr = curl_slist_append(http_headers.ptr, "User-Agent: llama-cpp");
-    for (const auto & header : params.headers) {
-        http_headers.ptr = curl_slist_append(http_headers.ptr, header.c_str());
-    }
-    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, http_headers.ptr);
-
-    CURLcode res = curl_easy_perform(curl.get());
-
-    if (res != CURLE_OK) {
-        std::string error_msg = curl_easy_strerror(res);
-        throw std::runtime_error("error: cannot make GET request: " + error_msg);
-    }
-
-    long res_code;
-    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &res_code);
-
-    return { res_code, std::move(res_buffer) };
 }
 
 /**
