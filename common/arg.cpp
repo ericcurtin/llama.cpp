@@ -473,8 +473,66 @@ static bool common_download_file_single(const std::string & url, const std::stri
         write_file(metadata_path, metadata.dump(4));
         LOG_DBG("%s: file metadata saved: %s\n", __func__, metadata_path.c_str());
 
-        bool was_perform_successful = curl_perform_with_retry(url, curl.get(), CURL_MAX_RETRY, CURL_RETRY_DELAY_SECONDS, "GET");
+        // Custom retry logic to handle range header updates on partial downloads
+        bool was_perform_successful = false;
+        int  remaining_attempts     = CURL_MAX_RETRY;
+
+        while (remaining_attempts > 0) {
+            // Check current partial file size and update Range header accordingly
+            long current_partial_size = 0;
+            if (std::filesystem::exists(path_temporary)) {
+                current_partial_size = static_cast<long>(std::filesystem::file_size(path_temporary));
+            }
+
+            // Reset and rebuild headers if partial size has changed
+            if (current_partial_size != partial_size) {
+                // Free the existing header list
+                if (http_headers.ptr) {
+                    curl_slist_free_all(http_headers.ptr);
+                    http_headers.ptr = nullptr;
+                }
+
+                // Rebuild headers
+                http_headers.ptr = curl_slist_append(http_headers.ptr, "User-Agent: llama-cpp");
+                if (!bearer_token.empty()) {
+                    std::string auth_header = "Authorization: Bearer " + bearer_token;
+                    http_headers.ptr        = curl_slist_append(http_headers.ptr, auth_header.c_str());
+                }
+
+                // Add Range header if we have partial data
+                if (current_partial_size > 0) {
+                    std::string range_header = "Range: bytes=" + std::to_string(current_partial_size) + "-";
+                    http_headers.ptr         = curl_slist_append(http_headers.ptr, range_header.c_str());
+                    LOG_INF("%s: updated Range header for retry: %s\n", __func__, range_header.c_str());
+                }
+
+                curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, http_headers.ptr);
+                partial_size = current_partial_size;
+            }
+
+            LOG_INF("%s: GET %s (attempt %d of %d)...\n", __func__, url.c_str(),
+                    CURL_MAX_RETRY - remaining_attempts + 1, CURL_MAX_RETRY);
+
+            CURLcode res = curl_easy_perform(curl.get());
+            if (res == CURLE_OK) {
+                was_perform_successful = true;
+                break;
+            }
+
+            int exponential_backoff_delay =
+                std::pow(CURL_RETRY_DELAY_SECONDS, CURL_MAX_RETRY - remaining_attempts) * 1000;
+            LOG_WRN("%s: curl_easy_perform() failed: %s, retrying after %d milliseconds...\n", __func__,
+                    curl_easy_strerror(res), exponential_backoff_delay);
+
+            remaining_attempts--;
+            if (remaining_attempts == 0) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(exponential_backoff_delay));
+        }
+
         if (!was_perform_successful) {
+            LOG_ERR("%s: curl_easy_perform() failed after %d attempts\n", __func__, CURL_MAX_RETRY);
             return false;
         }
 
