@@ -220,7 +220,7 @@ struct curl_slist_ptr {
 #define CURL_MAX_RETRY 3
 #define CURL_RETRY_DELAY_SECONDS 2
 
-static bool curl_perform_with_retry(const std::string & url, CURL * curl, int max_attempts, int retry_delay_seconds, const char * method_name) {
+static bool curl_perform_with_retry(const std::string & url, CURL * curl, int max_attempts, int retry_delay_seconds, const char * method_name, long partial_size = 0) {
     int remaining_attempts = max_attempts;
 
     while (remaining_attempts > 0) {
@@ -236,10 +236,18 @@ static bool curl_perform_with_retry(const std::string & url, CURL * curl, int ma
 
         remaining_attempts--;
         if (remaining_attempts == 0) break;
+
+        // Reset range header on retry if partial_size was set (indicates resume download)
+        // This is done by unsetting the range header to start download from beginning
+        if (partial_size > 0) {
+            LOG_INF("%s: resetting range header for retry (was resuming from byte %ld)\n", __func__, partial_size);
+            curl_easy_setopt(curl, CURLOPT_RANGE, nullptr);
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(exponential_backoff_delay));
     }
 
-    LOG_ERR("%s: curl_easy_perform() failed after %d attempts\n", __func__, max_attempts);
+    LOG_ERR("%s: curl_perform_with_retry() failed after %d attempts\n", __func__, max_attempts);
 
     return false;
 }
@@ -431,10 +439,9 @@ static bool common_download_file_single(const std::string & url, const std::stri
         curl_easy_setopt(curl.get(), CURLOPT_NOBODY, 0L);
         curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, static_cast<CURLOPT_WRITEFUNCTION_PTR>(write_callback));
         curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, outfile.get());
-        if (partial_size) { // Add Range header if resuming
-            std::string range_header = "Range: bytes=" + std::to_string(partial_size) + "-";
-            http_headers.ptr = curl_slist_append(http_headers.ptr, range_header.c_str());
-            curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, http_headers.ptr);
+        if (partial_size) { // Set range for resuming
+            std::string range_str = std::to_string(partial_size) + "-";
+            curl_easy_setopt(curl.get(), CURLOPT_RANGE, range_str.c_str());
         }
 
         //  display download progress
@@ -473,7 +480,7 @@ static bool common_download_file_single(const std::string & url, const std::stri
         write_file(metadata_path, metadata.dump(4));
         LOG_DBG("%s: file metadata saved: %s\n", __func__, metadata_path.c_str());
 
-        bool was_perform_successful = curl_perform_with_retry(url, curl.get(), CURL_MAX_RETRY, CURL_RETRY_DELAY_SECONDS, "GET");
+        bool was_perform_successful = curl_perform_with_retry(url, curl.get(), CURL_MAX_RETRY, CURL_RETRY_DELAY_SECONDS, "GET", partial_size);
         if (!was_perform_successful) {
             return false;
         }
