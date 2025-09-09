@@ -249,7 +249,96 @@ struct FILE_deleter {
 };
 
 // download one single file from remote URL to local path
-static bool common_download_file_single(const std::string & url, const std::string & path, const std::string & bearer_token, bool offline) {
+static bool common_download_file_single(const std::string & url, const std::string & path, const std::string & bearer_token, bool offline, bool is_docker = false) {
+    // For docker downloads, use simplified logic without caching/metadata
+    if (is_docker) {
+        // Check if the file already exists locally (simple existence check for docker)
+        if (std::filesystem::exists(path)) {
+            LOG_INF("%s: docker file already cached: %s\n", __func__, path.c_str());
+            return true;
+        }
+
+        if (offline) {
+            LOG_ERR("%s: required docker file is not available in cache (offline mode): %s\n", __func__, path.c_str());
+            return false;
+        }
+
+        // For docker downloads, proceed directly to download without HEAD requests or metadata
+        std::string path_temporary = path + ".tmp";
+        
+        // Remove any existing temporary file
+        if (std::filesystem::exists(path_temporary)) {
+            std::filesystem::remove(path_temporary);
+        }
+
+        std::unique_ptr<FILE, FILE_deleter> outfile(fopen(path_temporary.c_str(), "wb"));
+        if (!outfile) {
+            LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path_temporary.c_str());
+            return false;
+        }
+
+        // Initialize libcurl
+        curl_ptr       curl(curl_easy_init(), &curl_easy_cleanup);
+        curl_slist_ptr http_headers;
+        if (!curl) {
+            LOG_ERR("%s: error initializing libcurl\n", __func__);
+            return false;
+        }
+
+        // Set the URL and options
+        curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 1L);
+
+        http_headers.ptr = curl_slist_append(http_headers.ptr, "User-Agent: llama-cpp");
+        if (!bearer_token.empty()) {
+            std::string auth_header = "Authorization: Bearer " + bearer_token;
+            http_headers.ptr = curl_slist_append(http_headers.ptr, auth_header.c_str());
+        }
+        curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, http_headers.ptr);
+
+#if defined(_WIN32)
+        curl_easy_setopt(curl.get(), CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+#endif
+
+        typedef size_t(*CURLOPT_WRITEFUNCTION_PTR)(void * data, size_t size, size_t nmemb, void * fd);
+        auto write_callback = [](void * data, size_t size, size_t nmemb, void * fd) -> size_t {
+            return fwrite(data, size, nmemb, (FILE *)fd);
+        };
+        curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, static_cast<CURLOPT_WRITEFUNCTION_PTR>(write_callback));
+        curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, outfile.get());
+
+        // Perform the download
+        CURLcode res = curl_easy_perform(curl.get());
+        if (res != CURLE_OK) {
+            LOG_ERR("%s: curl_easy_perform() failed: %s\n", __func__, curl_easy_strerror(res));
+            outfile.reset();
+            std::filesystem::remove(path_temporary);
+            return false;
+        }
+
+        // Check HTTP response code
+        long response_code;
+        curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response_code);
+        if (response_code != 200) {
+            LOG_ERR("%s: HTTP error %ld\n", __func__, response_code);
+            outfile.reset();
+            std::filesystem::remove(path_temporary);
+            return false;
+        }
+
+        // Close the file and move to final location
+        outfile.reset();
+
+        if (std::filesystem::exists(path)) {
+            std::filesystem::remove(path);
+        }
+
+        std::filesystem::rename(path_temporary, path);
+        return true;
+    }
+
+    // Standard download logic for non-docker files
     // Check if the file already exists locally
     auto file_exists = std::filesystem::exists(path);
 
@@ -470,7 +559,7 @@ static bool common_download_file_multiple(const std::vector<std::pair<std::strin
     std::vector<std::future<bool>> futures_download;
     for (auto const & item : urls) {
         futures_download.push_back(std::async(std::launch::async, [bearer_token, offline](const std::pair<std::string, std::string> & it) -> bool {
-            return common_download_file_single(it.first, it.second, bearer_token, offline);
+            return common_download_file_single(it.first, it.second, bearer_token, offline, false);
         }, item));
     }
 
@@ -494,7 +583,7 @@ static bool common_download_model(
         return false;
     }
 
-    if (!common_download_file_single(model.url, model.path, bearer_token, offline)) {
+    if (!common_download_file_single(model.url, model.path, bearer_token, offline, false)) {
         return false;
     }
 
@@ -709,7 +798,7 @@ bool common_has_curl() {
     return false;
 }
 
-static bool common_download_file_single(const std::string &, const std::string &, const std::string &, bool) {
+static bool common_download_file_single(const std::string &, const std::string &, const std::string &, bool, bool = false) {
     LOG_ERR("error: built without CURL, cannot download model from internet\n");
     return false;
 }
@@ -765,90 +854,6 @@ std::string common_docker_get_token(const std::string & repo) {
 
     return response["token"].get<std::string>();
 }
-
-#ifdef LLAMA_USE_CURL
-
-// Helper function to download Docker blob directly to file
-static bool common_docker_download_blob(const std::string & blob_url,
-                                        const std::string & token,
-                                        const std::string & local_path) {
-    curl_ptr       curl(curl_easy_init(), &curl_easy_cleanup);
-    curl_slist_ptr http_headers;
-    if (!curl.get()) {
-        LOG_ERR("%s: curl_easy_init() failed\n", __func__);
-        return false;
-    }
-
-    // Prepare temporary filename for safe downloading
-    std::string path_temporary = local_path + ".tmp";
-    std::unique_ptr<FILE, FILE_deleter> outfile(fopen(path_temporary.c_str(), "wb"));
-    if (!outfile) {
-        LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path_temporary.c_str());
-        return false;
-    }
-
-    // Set up CURL options
-    curl_easy_setopt(curl.get(), CURLOPT_URL, blob_url.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
-
-    // Set up write callback to stream directly to file
-    typedef size_t (*CURLOPT_WRITEFUNCTION_PTR)(void * data, size_t size, size_t nmemb, void * fd);
-    auto write_callback = [](void * data, size_t size, size_t nmemb, void * fd) -> size_t {
-        return fwrite(data, size, nmemb, (FILE *) fd);
-    };
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, static_cast<CURLOPT_WRITEFUNCTION_PTR>(write_callback));
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, outfile.get());
-
-#    if defined(_WIN32)
-    curl_easy_setopt(curl.get(), CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
-#    endif
-
-    // Set headers
-    http_headers.ptr        = curl_slist_append(http_headers.ptr, "User-Agent: llama-cpp");
-    std::string auth_header = "Authorization: Bearer " + token;
-    http_headers.ptr        = curl_slist_append(http_headers.ptr, auth_header.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, http_headers.ptr);
-
-    // Perform the download
-    CURLcode res = curl_easy_perform(curl.get());
-    if (res != CURLE_OK) {
-        LOG_ERR("%s: curl_easy_perform() failed: %s\n", __func__, curl_easy_strerror(res));
-        outfile.reset();  // Close file before removing
-        std::filesystem::remove(path_temporary);
-        return false;
-    }
-
-    // Check HTTP response code
-    long response_code;
-    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response_code);
-    if (response_code != 200) {
-        LOG_ERR("%s: HTTP error %ld\n", __func__, response_code);
-        outfile.reset();  // Close file before removing
-        std::filesystem::remove(path_temporary);
-        return false;
-    }
-
-    // Close the file and move to final location
-    outfile.reset();
-
-    if (std::filesystem::exists(local_path)) {
-        std::filesystem::remove(local_path);
-    }
-
-    std::filesystem::rename(path_temporary, local_path);
-
-    return true;
-}
-
-#else
-
-static bool common_docker_download_blob(const std::string &, const std::string &, const std::string &) {
-    LOG_ERR("error: built without CURL, cannot download Docker blob\n");
-    return false;
-}
-
-#endif  // LLAMA_USE_CURL
 
 std::string common_docker_resolve_model(const std::string & docker_url) {
     // Parse docker://ai/smollm2:135M-Q4_K_M
@@ -914,9 +919,9 @@ std::string common_docker_resolve_model(const std::string & docker_url) {
             return local_path;
         }
 
-        // Download the blob using streaming approach
+        // Download the blob using common_download_file_single with is_docker=true
         std::string blob_url = "https://registry-1.docker.io/v2/" + repo + "/blobs/" + gguf_digest;
-        if (!common_docker_download_blob(blob_url, token, local_path)) {
+        if (!common_download_file_single(blob_url, local_path, token, false, true)) {
             throw std::runtime_error("Failed to download Docker blob");
         }
 
@@ -976,6 +981,12 @@ static handle_model_result common_params_handle_model(
         const std::string & model_path_default,
         bool offline) {
     handle_model_result result;
+    
+    // Handle Docker URLs by resolving them to local paths
+    if (!model.path.empty()) {
+        model.path = common_docker_resolve_model(model.path);
+    }
+    
     // handle pre-fill default model path and url based on hf_repo and hf_file
     {
         if (!model.hf_repo.empty()) {
