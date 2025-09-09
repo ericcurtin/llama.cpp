@@ -197,6 +197,7 @@ struct common_params_model {
     std::string url     = ""; // model url to download                                      // NOLINT
     std::string hf_repo = ""; // HF repo                                                    // NOLINT
     std::string hf_file = ""; // HF file                                                    // NOLINT
+    std::string docker  = "";  // Docker AI model url to download                            // NOLINT
 };
 
 struct common_params_speculative {
