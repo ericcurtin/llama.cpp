@@ -289,6 +289,7 @@ static bool common_download_file_single(const std::string & url, const std::stri
     struct common_load_model_from_url_headers {
         std::string etag;
         std::string last_modified;
+        std::string accept_ranges;
     };
 
     common_load_model_from_url_headers headers;
@@ -328,6 +329,7 @@ static bool common_download_file_single(const std::string & url, const std::stri
         static std::regex header_regex("([^:]+): (.*)\r\n");
         static std::regex etag_regex("ETag", std::regex_constants::icase);
         static std::regex last_modified_regex("Last-Modified", std::regex_constants::icase);
+        static std::regex accept_ranges_regex("Accept-Ranges", std::regex_constants::icase);
 
         std::string header(buffer, n_items);
         std::smatch match;
@@ -338,6 +340,8 @@ static bool common_download_file_single(const std::string & url, const std::stri
                 headers->etag = value;
             } else if (std::regex_match(key, match, last_modified_regex)) {
                 headers->last_modified = value;
+            } else if (std::regex_match(key, match, accept_ranges_regex)) {
+                headers->accept_ranges = value;
             }
         }
         return n_items;
@@ -380,7 +384,22 @@ static bool common_download_file_single(const std::string & url, const std::stri
 
     if (should_download) {
         std::string path_temporary = path + ".downloadInProgress";
-        if (file_exists) {
+        long partial_size = 0; // Check if partial download exists and get its size
+        if (std::filesystem::exists(path_temporary)) {
+            partial_size = static_cast<long>(std::filesystem::file_size(path_temporary));
+            LOG_INF("%s: found partial download: %s (%ld bytes)\n", __func__, path_temporary.c_str(), partial_size);
+            if (head_request_ok) { // Check if server supports range requests
+                bool server_supports_ranges = (headers.accept_ranges == "bytes");
+                if (server_supports_ranges && partial_size > 0) {
+                    LOG_INF("%s: server supports range requests, resuming download from byte %ld\n", __func__, partial_size);
+                }
+                else {
+                    partial_size = 0;
+                }
+            }
+        }
+
+        if (file_exists && !partial_size) {
             LOG_WRN("%s: deleting previous downloaded file: %s\n", __func__, path.c_str());
             if (remove(path.c_str()) != 0) {
                 LOG_ERR("%s: unable to delete file: %s\n", __func__, path.c_str());
@@ -396,7 +415,9 @@ static bool common_download_file_single(const std::string & url, const std::stri
             }
         };
 
-        std::unique_ptr<FILE, FILE_deleter> outfile(fopen(path_temporary.c_str(), "wb"));
+        // Open file in append mode if resuming, otherwise create new file
+        const char * mode = partial_size ? "ab" : "wb";
+        std::unique_ptr<FILE, FILE_deleter> outfile(fopen(path_temporary.c_str(), mode));
         if (!outfile) {
             LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path.c_str());
             return false;
@@ -406,9 +427,15 @@ static bool common_download_file_single(const std::string & url, const std::stri
         auto write_callback = [](void * data, size_t size, size_t nmemb, void * fd) -> size_t {
             return fwrite(data, size, nmemb, (FILE *)fd);
         };
+
         curl_easy_setopt(curl.get(), CURLOPT_NOBODY, 0L);
         curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, static_cast<CURLOPT_WRITEFUNCTION_PTR>(write_callback));
         curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, outfile.get());
+        if (partial_size) { // Add Range header if resuming
+            std::string range_header = "Range: bytes=" + std::to_string(partial_size) + "-";
+            http_headers.ptr = curl_slist_append(http_headers.ptr, range_header.c_str());
+            curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, http_headers.ptr);
+        }
 
         //  display download progress
         curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
@@ -429,8 +456,13 @@ static bool common_download_file_single(const std::string & url, const std::stri
         };
 
         // start the download
-        LOG_INF("%s: trying to download model from %s to %s (server_etag:%s, server_last_modified:%s)...\n", __func__,
-            llama_download_hide_password_in_url(url).c_str(), path.c_str(), headers.etag.c_str(), headers.last_modified.c_str());
+        if (partial_size) {
+            LOG_INF("%s: resuming download from %s to %s from byte %ld (server_etag:%s, server_last_modified:%s)...\n", __func__,
+                llama_download_hide_password_in_url(url).c_str(), path.c_str(), partial_size, headers.etag.c_str(), headers.last_modified.c_str());
+        } else {
+            LOG_INF("%s: trying to download model from %s to %s (server_etag:%s, server_last_modified:%s)...\n", __func__,
+                llama_download_hide_password_in_url(url).c_str(), path.c_str(), headers.etag.c_str(), headers.last_modified.c_str());
+        }
 
         // Write the updated JSON metadata file.
         metadata.update({
