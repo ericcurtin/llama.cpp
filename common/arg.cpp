@@ -380,7 +380,56 @@ static bool common_download_file_single(const std::string & url, const std::stri
 
     if (should_download) {
         std::string path_temporary = path + ".downloadInProgress";
-        if (file_exists) {
+        
+        // Check if partial download exists and get its size
+        long partial_size = 0;
+        bool resume_download = false;
+        bool server_supports_ranges = false;
+        
+        if (std::filesystem::exists(path_temporary)) {
+            partial_size = static_cast<long>(std::filesystem::file_size(path_temporary));
+            LOG_INF("%s: found partial download: %s (%ld bytes)\n", __func__, path_temporary.c_str(), partial_size);
+            
+            // Check if server supports range requests
+            if (head_request_ok) {
+                // Send another HEAD request to check for Accept-Ranges header
+                curl_easy_setopt(curl.get(), CURLOPT_NOBODY, 1L);
+                curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 1L);
+                
+                // Custom header callback to check for Accept-Ranges
+                std::string accept_ranges;
+                auto range_header_callback = [](char * buffer, size_t /*size*/, size_t n_items, void * userdata) -> size_t {
+                    std::string * accept_ranges = static_cast<std::string *>(userdata);
+                    
+                    static std::regex header_regex("([^:]+): (.*)\r\n");
+                    static std::regex accept_ranges_regex("Accept-Ranges", std::regex_constants::icase);
+                    
+                    std::string header(buffer, n_items);
+                    std::smatch match;
+                    if (std::regex_match(header, match, header_regex)) {
+                        const std::string & key = match[1];
+                        const std::string & value = match[2];
+                        if (std::regex_match(key, match, accept_ranges_regex)) {
+                            *accept_ranges = value;
+                        }
+                    }
+                    return n_items;
+                };
+                
+                curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, static_cast<CURLOPT_HEADERFUNCTION_PTR>(range_header_callback));
+                curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &accept_ranges);
+                
+                if (curl_perform_with_retry(url, curl.get(), 1, 0, "HEAD")) {
+                    server_supports_ranges = (accept_ranges == "bytes");
+                    if (server_supports_ranges && partial_size > 0) {
+                        resume_download = true;
+                        LOG_INF("%s: server supports range requests, resuming download from byte %ld\n", __func__, partial_size);
+                    }
+                }
+            }
+        }
+        
+        if (file_exists && !resume_download) {
             LOG_WRN("%s: deleting previous downloaded file: %s\n", __func__, path.c_str());
             if (remove(path.c_str()) != 0) {
                 LOG_ERR("%s: unable to delete file: %s\n", __func__, path.c_str());
@@ -396,7 +445,9 @@ static bool common_download_file_single(const std::string & url, const std::stri
             }
         };
 
-        std::unique_ptr<FILE, FILE_deleter> outfile(fopen(path_temporary.c_str(), "wb"));
+        // Open file in append mode if resuming, otherwise create new file
+        const char * mode = resume_download ? "ab" : "wb";
+        std::unique_ptr<FILE, FILE_deleter> outfile(fopen(path_temporary.c_str(), mode));
         if (!outfile) {
             LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path.c_str());
             return false;
@@ -409,6 +460,13 @@ static bool common_download_file_single(const std::string & url, const std::stri
         curl_easy_setopt(curl.get(), CURLOPT_NOBODY, 0L);
         curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, static_cast<CURLOPT_WRITEFUNCTION_PTR>(write_callback));
         curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, outfile.get());
+        
+        // Add Range header if resuming
+        if (resume_download && partial_size > 0) {
+            std::string range_header = "Range: bytes=" + std::to_string(partial_size) + "-";
+            http_headers.ptr = curl_slist_append(http_headers.ptr, range_header.c_str());
+            curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, http_headers.ptr);
+        }
 
         //  display download progress
         curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
@@ -429,8 +487,13 @@ static bool common_download_file_single(const std::string & url, const std::stri
         };
 
         // start the download
-        LOG_INF("%s: trying to download model from %s to %s (server_etag:%s, server_last_modified:%s)...\n", __func__,
-            llama_download_hide_password_in_url(url).c_str(), path.c_str(), headers.etag.c_str(), headers.last_modified.c_str());
+        if (resume_download) {
+            LOG_INF("%s: resuming download from %s to %s from byte %ld (server_etag:%s, server_last_modified:%s)...\n", __func__,
+                llama_download_hide_password_in_url(url).c_str(), path.c_str(), partial_size, headers.etag.c_str(), headers.last_modified.c_str());
+        } else {
+            LOG_INF("%s: trying to download model from %s to %s (server_etag:%s, server_last_modified:%s)...\n", __func__,
+                llama_download_hide_password_in_url(url).c_str(), path.c_str(), headers.etag.c_str(), headers.last_modified.c_str());
+        }
 
         // Write the updated JSON metadata file.
         metadata.update({
@@ -448,8 +511,16 @@ static bool common_download_file_single(const std::string & url, const std::stri
 
         long http_code = 0;
         curl_easy_getinfo (curl.get(), CURLINFO_RESPONSE_CODE, &http_code);
-        if (http_code < 200 || http_code >= 400) {
-            LOG_ERR("%s: invalid http status code received: %ld\n", __func__, http_code);
+        // Accept both 200 (full content) and 206 (partial content) as success
+        if (http_code == 200 || (http_code == 206 && resume_download)) {
+            // Success - log which type of download completed
+            if (http_code == 206) {
+                LOG_INF("%s: successfully resumed partial download (HTTP 206)\n", __func__);
+            } else if (resume_download && http_code == 200) {
+                LOG_INF("%s: server sent full content despite range request (HTTP 200)\n", __func__);
+            }
+        } else {
+            LOG_ERR("%s: invalid http status code received: %ld (expected 200%s)\n", __func__, http_code, resume_download ? " or 206" : "");
             return false;
         }
 
