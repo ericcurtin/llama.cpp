@@ -772,6 +772,38 @@ std::string common_docker_get_token(const std::string & repo) {
 static bool common_docker_download_blob(const std::string & blob_url,
                                         const std::string & token,
                                         const std::string & local_path) {
+    // Check if the file already exists locally
+    auto file_exists = std::filesystem::exists(local_path);
+
+    // If the file exists, check its JSON metadata companion file.
+    std::string    metadata_path = local_path + ".json";
+    nlohmann::json metadata;
+    std::string    etag;
+    std::string    last_modified;
+
+    if (file_exists) {
+        // Try and read the JSON metadata file
+        std::ifstream metadata_in(metadata_path);
+        if (metadata_in.good()) {
+            try {
+                metadata_in >> metadata;
+                LOG_DBG("%s: previous metadata file found %s: %s\n", __func__, metadata_path.c_str(),
+                        metadata.dump().c_str());
+                if (metadata.contains("etag") && metadata.at("etag").is_string()) {
+                    etag = metadata.at("etag");
+                }
+                if (metadata.contains("lastModified") && metadata.at("lastModified").is_string()) {
+                    last_modified = metadata.at("lastModified");
+                }
+            } catch (const nlohmann::json::exception & e) {
+                LOG_ERR("%s: error reading metadata file %s: %s\n", __func__, metadata_path.c_str(), e.what());
+            }
+        }
+        // if we cannot open the metadata file, we assume that the downloaded file is not valid (etag and last-modified are left empty, so we will download it again)
+    } else {
+        LOG_INF("%s: no previous Docker blob file found %s\n", __func__, local_path.c_str());
+    }
+
     curl_ptr       curl(curl_easy_init(), &curl_easy_cleanup);
     curl_slist_ptr http_headers;
     if (!curl.get()) {
@@ -779,64 +811,160 @@ static bool common_docker_download_blob(const std::string & blob_url,
         return false;
     }
 
-    // Prepare temporary filename for safe downloading
-    std::string path_temporary = local_path + ".tmp";
-    std::unique_ptr<FILE, FILE_deleter> outfile(fopen(path_temporary.c_str(), "wb"));
-    if (!outfile) {
-        LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path_temporary.c_str());
-        return false;
-    }
-
-    // Set up CURL options
-    curl_easy_setopt(curl.get(), CURLOPT_URL, blob_url.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
-
-    // Set up write callback to stream directly to file
-    typedef size_t (*CURLOPT_WRITEFUNCTION_PTR)(void * data, size_t size, size_t nmemb, void * fd);
-    auto write_callback = [](void * data, size_t size, size_t nmemb, void * fd) -> size_t {
-        return fwrite(data, size, nmemb, (FILE *) fd);
+    // Send a HEAD request to retrieve the etag and last-modified headers
+    struct common_load_model_from_url_headers {
+        std::string etag;
+        std::string last_modified;
     };
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, static_cast<CURLOPT_WRITEFUNCTION_PTR>(write_callback));
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, outfile.get());
 
-#    if defined(_WIN32)
-    curl_easy_setopt(curl.get(), CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
-#    endif
+    common_load_model_from_url_headers headers;
+    bool                               head_request_ok = false;
+    bool should_download = !file_exists;  // by default, we should download if the file does not exist
 
-    // Set headers
+    // Set up headers for authentication
     http_headers.ptr        = curl_slist_append(http_headers.ptr, "User-Agent: llama-cpp");
     std::string auth_header = "Authorization: Bearer " + token;
     http_headers.ptr        = curl_slist_append(http_headers.ptr, auth_header.c_str());
     curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, http_headers.ptr);
 
-    // Perform the download
+    curl_easy_setopt(curl.get(), CURLOPT_URL, blob_url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
+
+#    if defined(_WIN32)
+    curl_easy_setopt(curl.get(), CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+#    endif
+
+    typedef size_t (*CURLOPT_HEADERFUNCTION_PTR)(char *, size_t, size_t, void *);
+    auto header_callback = [](char * buffer, size_t /*size*/, size_t n_items, void * userdata) -> size_t {
+        common_load_model_from_url_headers * headers = (common_load_model_from_url_headers *) userdata;
+
+        static std::regex header_regex("([^:]+): (.*)\r\n");
+        static std::regex etag_regex("ETag", std::regex_constants::icase);
+        static std::regex last_modified_regex("Last-Modified", std::regex_constants::icase);
+
+        std::string header(buffer, n_items);
+        std::smatch match;
+        if (std::regex_match(header, match, header_regex)) {
+            const std::string & key   = match[1];
+            const std::string & value = match[2];
+            if (std::regex_match(key, match, etag_regex)) {
+                headers->etag = value;
+            } else if (std::regex_match(key, match, last_modified_regex)) {
+                headers->last_modified = value;
+            }
+        }
+        return n_items;
+    };
+
+    curl_easy_setopt(curl.get(), CURLOPT_NOBODY, 1L);      // will trigger the HEAD verb
+    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 1L);  // hide head request progress
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, static_cast<CURLOPT_HEADERFUNCTION_PTR>(header_callback));
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &headers);
+
+    // Perform HEAD request
     CURLcode res = curl_easy_perform(curl.get());
-    if (res != CURLE_OK) {
-        LOG_ERR("%s: curl_easy_perform() failed: %s\n", __func__, curl_easy_strerror(res));
-        outfile.reset();  // Close file before removing
-        std::filesystem::remove(path_temporary);
-        return false;
+    if (res == CURLE_OK) {
+        long response_code;
+        curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response_code);
+        if (response_code == 200) {
+            head_request_ok = true;
+        } else {
+            LOG_WRN("%s: HEAD invalid http status code received: %ld\n", __func__, response_code);
+            head_request_ok = false;
+        }
+    } else {
+        LOG_WRN("%s: HEAD request failed: %s\n", __func__, curl_easy_strerror(res));
+        head_request_ok = false;
     }
 
-    // Check HTTP response code
-    long response_code;
-    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response_code);
-    if (response_code != 200) {
-        LOG_ERR("%s: HTTP error %ld\n", __func__, response_code);
-        outfile.reset();  // Close file before removing
-        std::filesystem::remove(path_temporary);
-        return false;
+    // if head_request_ok is false, we don't have the etag or last-modified headers
+    // we leave should_download as-is, which is true if the file does not exist
+    if (head_request_ok) {
+        // check if ETag or Last-Modified headers are different
+        // if it is, we need to download the file again
+        if (!etag.empty() && etag != headers.etag) {
+            LOG_WRN("%s: ETag header is different (%s != %s): triggering a new download\n", __func__, etag.c_str(),
+                    headers.etag.c_str());
+            should_download = true;
+        } else if (!last_modified.empty() && last_modified != headers.last_modified) {
+            LOG_WRN("%s: Last-Modified header is different (%s != %s): triggering a new download\n", __func__,
+                    last_modified.c_str(), headers.last_modified.c_str());
+            should_download = true;
+        }
     }
 
-    // Close the file and move to final location
-    outfile.reset();
+    if (should_download) {
+        // Prepare temporary filename for safe downloading
+        std::string                         path_temporary = local_path + ".tmp";
+        std::unique_ptr<FILE, FILE_deleter> outfile(fopen(path_temporary.c_str(), "wb"));
+        if (!outfile) {
+            LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path_temporary.c_str());
+            return false;
+        }
 
-    if (std::filesystem::exists(local_path)) {
-        std::filesystem::remove(local_path);
+        if (file_exists) {
+            LOG_WRN("%s: deleting previous downloaded file: %s\n", __func__, local_path.c_str());
+            if (remove(local_path.c_str()) != 0) {
+                LOG_ERR("%s: unable to delete file: %s\n", __func__, local_path.c_str());
+                return false;
+            }
+        }
+
+        // Set up write callback to stream directly to file
+        typedef size_t (*CURLOPT_WRITEFUNCTION_PTR)(void * data, size_t size, size_t nmemb, void * fd);
+        auto write_callback = [](void * data, size_t size, size_t nmemb, void * fd) -> size_t {
+            return fwrite(data, size, nmemb, (FILE *) fd);
+        };
+        curl_easy_setopt(curl.get(), CURLOPT_NOBODY, 0L);
+        curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, static_cast<CURLOPT_WRITEFUNCTION_PTR>(write_callback));
+        curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, outfile.get());
+
+        //  display download progress
+        curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+
+        // start the download
+        LOG_INF("%s: trying to download Docker blob from %s to %s (server_etag:%s, server_last_modified:%s)...\n",
+                __func__, blob_url.c_str(), local_path.c_str(), headers.etag.c_str(), headers.last_modified.c_str());
+
+        // Perform the download
+        res = curl_easy_perform(curl.get());
+        if (res != CURLE_OK) {
+            LOG_ERR("%s: curl_easy_perform() failed: %s\n", __func__, curl_easy_strerror(res));
+            outfile.reset();  // Close file before removing
+            std::filesystem::remove(path_temporary);
+            return false;
+        }
+
+        // Check HTTP response code
+        long response_code;
+        curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response_code);
+        if (response_code != 200) {
+            LOG_ERR("%s: HTTP error %ld\n", __func__, response_code);
+            outfile.reset();  // Close file before removing
+            std::filesystem::remove(path_temporary);
+            return false;
+        }
+
+        // Close the file and move to final location
+        outfile.reset();
+
+        // Write the updated JSON metadata file.
+        metadata.update({
+            { "url",          blob_url              },
+            { "etag",         headers.etag          },
+            { "lastModified", headers.last_modified }
+        });
+        write_file(metadata_path, metadata.dump(4));
+        LOG_DBG("%s: Docker blob metadata saved: %s\n", __func__, metadata_path.c_str());
+
+        if (std::filesystem::exists(local_path)) {
+            std::filesystem::remove(local_path);
+        }
+
+        std::filesystem::rename(path_temporary, local_path);
+    } else {
+        LOG_INF("%s: using cached Docker blob: %s\n", __func__, local_path.c_str());
     }
-
-    std::filesystem::rename(path_temporary, local_path);
 
     return true;
 }
