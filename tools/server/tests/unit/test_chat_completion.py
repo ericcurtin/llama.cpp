@@ -93,8 +93,9 @@ def test_chat_completion_stream(system_prompt, user_prompt, max_tokens, re_conte
                 assert choice["finish_reason"] is None
                 content += choice["delta"]["content"] or ''
         else:
-            assert data["usage"]["prompt_tokens"] == n_prompt
-            assert data["usage"]["completion_tokens"] == n_predicted
+            # After our changes, usage is only included when stream_options.include_usage is true
+            # Since this test doesn't specify stream_options, no usage should be present
+            assert "usage" not in data
 
 
 def test_chat_completion_with_openai_library():
@@ -450,3 +451,99 @@ def test_return_progresssss(n_batch, batch_count, reuse_cache):
     assert last_progress["total"] > 0
     assert last_progress["processed"] == last_progress["total"]
     assert total_batch_count == batch_count
+
+
+@pytest.mark.parametrize(
+    "include_usage,expect_usage_chunk",
+    [
+        (True, True),   # stream_options.include_usage = true should include usage
+        (False, False), # stream_options.include_usage = false should NOT include usage
+    ]
+)
+def test_chat_completion_stream_options_include_usage(include_usage: bool, expect_usage_chunk: bool):
+    global server
+    server.start()
+    
+    # Create the request data
+    request_data = {
+        "max_tokens": 8,
+        "messages": [
+            {"role": "system", "content": "Book"},
+            {"role": "user", "content": "What is the best book"},
+        ],
+        "stream": True,
+        "stream_options": {
+            "include_usage": include_usage
+        }
+    }
+    
+    res = server.make_stream_request("POST", "/chat/completions", data=request_data)
+    
+    found_usage_chunk = False
+    content = ""
+    last_cmpl_id = None
+    
+    for i, data in enumerate(res):
+        if data["choices"]:
+            choice = data["choices"][0]
+            if i == 0:
+                # Check first role message for stream=True
+                assert choice["delta"]["content"] is None
+                assert choice["delta"]["role"] == "assistant"
+            else:
+                assert "role" not in choice["delta"]
+            assert data["system_fingerprint"].startswith("b")
+            assert "gpt-3.5" in data["model"] # DEFAULT_OAICOMPAT_MODEL
+            if last_cmpl_id is None:
+                last_cmpl_id = data["id"]
+            assert last_cmpl_id == data["id"] # make sure the completion id is the same for all events in the stream
+            if choice["finish_reason"] in ["stop", "length"]:
+                assert "content" not in choice["delta"]
+                assert choice["finish_reason"] == "length"
+            else:
+                assert choice["finish_reason"] is None
+                content += choice["delta"]["content"] or ''
+        else:
+            # This is the final chunk with empty choices - should contain usage if include_usage is true
+            found_usage_chunk = True
+            if expect_usage_chunk:
+                assert "usage" in data
+                assert "prompt_tokens" in data["usage"]
+                assert "completion_tokens" in data["usage"]
+                assert "total_tokens" in data["usage"]
+                assert data["usage"]["total_tokens"] == data["usage"]["prompt_tokens"] + data["usage"]["completion_tokens"]
+            else:
+                assert "usage" not in data
+                
+    # We should only find a usage chunk if include_usage is true
+    assert found_usage_chunk == expect_usage_chunk
+
+
+def test_chat_completion_stream_without_stream_options():
+    """Test that streaming without stream_options behaves as before (no usage included)"""
+    global server
+    server.start()
+    
+    request_data = {
+        "max_tokens": 8,
+        "messages": [
+            {"role": "system", "content": "Book"},
+            {"role": "user", "content": "What is the best book"},
+        ],
+        "stream": True,
+        # No stream_options provided
+    }
+    
+    res = server.make_stream_request("POST", "/chat/completions", data=request_data)
+    
+    found_usage_chunk = False
+    
+    for data in res:
+        if not data["choices"]:
+            # This is the final chunk with empty choices
+            found_usage_chunk = True
+            # Should not contain usage when stream_options is not provided
+            assert "usage" not in data
+                
+    # Should not find any usage chunk when stream_options is not provided  
+    assert not found_usage_chunk
