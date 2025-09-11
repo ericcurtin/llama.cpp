@@ -130,6 +130,9 @@ struct slot_params {
     bool timings_per_token = false;
     bool post_sampling_probs = false;
 
+    // stream_options for OAI compatible chat/completions streaming
+    json stream_options = json::object();
+
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 
@@ -321,6 +324,7 @@ struct server_task {
       //params.t_max_prompt_ms  = json_value(data, "t_max_prompt_ms",    defaults.t_max_prompt_ms); // TODO: implement
         params.t_max_predict_ms = json_value(data, "t_max_predict_ms",   defaults.t_max_predict_ms);
         params.response_fields  = json_value(data, "response_fields",   std::vector<std::string>());
+        params.stream_options   = json_value(data, "stream_options",    json::object());
 
         params.sampling.top_k              = json_value(data, "top_k",              defaults.sampling.top_k);
         params.sampling.top_p              = json_value(data, "top_p",              defaults.sampling.top_p);
@@ -984,22 +988,35 @@ struct server_task_result_cmpl_final : server_task_result {
 
         // OpenAI API spec for chat.completion.chunks specifies an empty `choices` array for the last chunk when including usage
         // https://platform.openai.com/docs/api-reference/chat_streaming/streaming#chat_streaming/streaming-choices
-        deltas.push_back({
-            {"choices", json::array()},
-            {"created",            t},
-            {"id",                 oaicompat_cmpl_id},
-            {"model",              oaicompat_model},
-            {"system_fingerprint", build_info},
-            {"object",             "chat.completion.chunk"},
-            {"usage", json {
-                {"completion_tokens", n_decoded},
-                {"prompt_tokens",     n_prompt_tokens},
-                {"total_tokens",      n_decoded + n_prompt_tokens},
-            }},
-        });
+        
+        // Check if stream_options.include_usage is true
+        bool include_usage = false;
+        if (generation_params.stream_options.contains("include_usage")) {
+            include_usage = json_value(generation_params.stream_options, "include_usage", false);
+        }
+        
+        if (include_usage) {
+            deltas.push_back({
+                {"choices", json::array()},
+                {"created",            t},
+                {"id",                 oaicompat_cmpl_id},
+                {"model",              oaicompat_model},
+                {"system_fingerprint", build_info},
+                {"object",             "chat.completion.chunk"},
+                {"usage", json {
+                    {"completion_tokens", n_decoded},
+                    {"prompt_tokens",     n_prompt_tokens},
+                    {"total_tokens",      n_decoded + n_prompt_tokens},
+                }},
+            });
+        }
 
         if (timings.prompt_n >= 0) {
-            deltas.back().push_back({"timings", timings.to_json()});
+            if (include_usage && !deltas.empty()) {
+                deltas.back().push_back({"timings", timings.to_json()});
+            } else if (!include_usage && deltas.size() >= 2) {
+                deltas[deltas.size() - 2].push_back({"timings", timings.to_json()});
+            }
         }
 
         // extra fields for debugging purposes
