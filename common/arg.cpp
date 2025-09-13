@@ -58,12 +58,27 @@ static std::string read_file(const std::string & fname) {
 
 static void write_file(const std::string & fname, const std::string & content) {
     const std::string fname_tmp = fname + ".tmp";
-    std::ofstream     file(fname_tmp);
-    if (!file) {
-        throw std::runtime_error(string_format("error: failed to open file '%s'\n", fname.c_str()));
+
+    struct FILE_deleter {
+        void operator()(FILE * f) const {
+            if (f) {
+                fclose(f);
+            }
+        }
+    };
+
+    std::unique_ptr<FILE, FILE_deleter> outfile(fopen(fname_tmp.c_str(), "wb"));
+    if (!outfile) {
+        throw std::runtime_error(string_format("error: failed to open file '%s'\n", fname_tmp.c_str()));
     }
-    file << content;
-    file.close();
+
+    size_t written = fwrite(content.c_str(), 1, content.size(), outfile.get());
+    if (written != content.size()) {
+        throw std::runtime_error(
+            string_format("error: failed to write complete content to file '%s'\n", fname_tmp.c_str()));
+    }
+
+    outfile.reset();  // Close file explicitly before rename
 
     // Makes write atomic
     if (rename(fname_tmp.c_str(), fname.c_str()) != 0) {
@@ -235,85 +250,114 @@ static bool curl_perform_with_retry(const std::string & url,
     int remaining_attempts = max_attempts;
 
     while (remaining_attempts > 0) {
-        LOG_INF("%s: %s %s (attempt %d of %d)...\n", __func__ , method_name, url.c_str(), max_attempts - remaining_attempts + 1, max_attempts);
+        LOG_INF("%s: %s %s (attempt %d of %d)...\n", __func__, method_name, url.c_str(),
+                max_attempts - remaining_attempts + 1, max_attempts);
 
-        if (std::filesystem::exists(path_temporary)) {
+        // Check if we can resume the download using ranges
+        if (!path_temporary.empty() && std::filesystem::exists(path_temporary)) {
             const long partial_size = static_cast<long>(std::filesystem::file_size(path_temporary));
-            LOG_INF("%s: server supports range requests, resuming download from byte %ld\n", __func__, partial_size);
-            const std::string range_str = std::to_string(partial_size) + "-";
-            curl_easy_setopt(curl, CURLOPT_RANGE, range_str.c_str());
+            if (partial_size > 0) {
+                LOG_INF("%s: resuming download from byte %ld\n", __func__, partial_size);
+                const std::string range_str = std::to_string(partial_size) + "-";
+                curl_easy_setopt(curl, CURLOPT_RANGE, range_str.c_str());
+            }
         }
 
         CURLcode res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
-            return true;
+            // Check HTTP response code
+            long http_code = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+            if (http_code == 200 || http_code == 206) {  // 200 OK or 206 Partial Content
+                return true;
+            } else if (http_code >= 400) {
+                LOG_ERR("%s: HTTP error %ld for %s\n", __func__, http_code, url.c_str());
+                return false;
+            }
         }
 
+        // Calculate exponential backoff delay
         int exponential_backoff_delay = std::pow(retry_delay_seconds, max_attempts - remaining_attempts) * 1000;
         LOG_WRN("%s: curl_easy_perform() failed: %s, retrying after %d milliseconds...\n", __func__, curl_easy_strerror(res), exponential_backoff_delay);
 
         remaining_attempts--;
         if (remaining_attempts == 0) break;
+
+        // Clear any range settings for retry
+        curl_easy_setopt(curl, CURLOPT_RANGE, nullptr);
         std::this_thread::sleep_for(std::chrono::milliseconds(exponential_backoff_delay));
     }
 
     LOG_ERR("%s: curl_easy_perform() failed after %d attempts\n", __func__, max_attempts);
-
     return false;
 }
 
 // download one single file from remote URL to local path
-static bool common_download_file_single(const std::string & url, const std::string & path, const std::string & bearer_token, bool offline) {
-    // If the file exists, check its JSON metadata companion file.
+static bool common_download_file_single(const std::string & url,
+                                        const std::string & path,
+                                        const std::string & bearer_token,
+                                        bool                offline) {
     std::string metadata_path = path + ".json";
-    nlohmann::json metadata; // TODO @ngxson : get rid of this json, use regex instead
-    std::string etag;
-    std::string last_modified;
+    nlohmann::json metadata;
+    std::string    cached_etag;
+    std::string    cached_last_modified;
 
-    // Check if the file already exists locally
-    auto file_exists = std::filesystem::exists(path);
+    // Check if file already exists locally
+    bool file_exists = std::filesystem::exists(path);
+
     if (file_exists) {
         if (offline) {
             LOG_INF("%s: using cached file (offline mode): %s\n", __func__, path.c_str());
-            return true; // skip verification/downloading
+            return true;
         }
-        // Try and read the JSON metadata file (note: stream autoclosed upon exiting this block).
-        std::ifstream metadata_in(metadata_path);
-        if (metadata_in.good()) {
-            try {
-                metadata_in >> metadata;
-                LOG_DBG("%s: previous metadata file found %s: %s\n", __func__, metadata_path.c_str(), metadata.dump().c_str());
-                if (metadata.contains("etag") && metadata.at("etag").is_string()) {
-                    etag = metadata.at("etag");
+
+        // Load existing metadata for staleness check
+        struct FILE_deleter {
+            void operator()(FILE * f) const {
+                if (f) {
+                    fclose(f);
                 }
-                if (metadata.contains("lastModified") && metadata.at("lastModified").is_string()) {
-                    last_modified = metadata.at("lastModified");
+            }
+        };
+
+        std::unique_ptr<FILE, FILE_deleter> metadata_file(fopen(metadata_path.c_str(), "rb"));
+        if (metadata_file) {
+            // Read the entire file into a string
+            fseek(metadata_file.get(), 0, SEEK_END);
+            long file_size = ftell(metadata_file.get());
+            fseek(metadata_file.get(), 0, SEEK_SET);
+
+            if (file_size > 0) {
+                std::string metadata_content(file_size, '\0');
+                size_t      bytes_read = fread(&metadata_content[0], 1, file_size, metadata_file.get());
+
+                if (bytes_read == static_cast<size_t>(file_size)) {
+                    try {
+                        metadata = nlohmann::json::parse(metadata_content);
+                        LOG_DBG("%s: loaded metadata: %s\n", __func__, metadata.dump().c_str());
+
+                        if (metadata.contains("etag") && metadata.at("etag").is_string()) {
+                            cached_etag = metadata.at("etag");
+                        }
+                        if (metadata.contains("lastModified") && metadata.at("lastModified").is_string()) {
+                            cached_last_modified = metadata.at("lastModified");
+                        }
+                    } catch (const nlohmann::json::exception & e) {
+                        LOG_ERR("%s: error parsing metadata file %s: %s\n", __func__, metadata_path.c_str(), e.what());
+                        // Continue without cached metadata
+                    }
                 }
-            } catch (const nlohmann::json::exception & e) {
-                LOG_ERR("%s: error reading metadata file %s: %s\n", __func__, metadata_path.c_str(), e.what());
             }
         }
-        // if we cannot open the metadata file, we assume that the downloaded file is not valid (etag and last-modified are left empty, so we will download it again)
     } else {
         if (offline) {
             LOG_ERR("%s: required file is not available in cache (offline mode): %s\n", __func__, path.c_str());
             return false;
         }
-        LOG_INF("%s: no previous model file found %s\n", __func__, path.c_str());
+        LOG_INF("%s: no previous file found %s\n", __func__, path.c_str());
     }
 
-    // Send a HEAD request to retrieve the etag and last-modified headers
-    struct common_load_model_from_url_headers {
-        std::string etag;
-        std::string last_modified;
-        std::string accept_ranges;
-    };
-
-    common_load_model_from_url_headers headers;
-    bool head_request_ok = false;
-    bool should_download = !file_exists; // by default, we should download if the file does not exist
-
-    // Initialize libcurl
+    // Initialize CURL for header inspection
     curl_ptr       curl(curl_easy_init(), &curl_easy_cleanup);
     curl_slist_ptr http_headers;
     if (!curl) {
@@ -321,32 +365,37 @@ static bool common_download_file_single(const std::string & url, const std::stri
         return false;
     }
 
-    // Set the URL, allow to follow http redirection
+    // Setup basic CURL options
     curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
 
     http_headers.ptr = curl_slist_append(http_headers.ptr, "User-Agent: llama-cpp");
-    // Check if hf-token or bearer-token was specified
     if (!bearer_token.empty()) {
         std::string auth_header = "Authorization: Bearer " + bearer_token;
         http_headers.ptr = curl_slist_append(http_headers.ptr, auth_header.c_str());
     }
     curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, http_headers.ptr);
 
-#if defined(_WIN32)
-    // CURLSSLOPT_NATIVE_CA tells libcurl to use standard certificate store of
-    //   operating system. Currently implemented under MS-Windows.
+#    if defined(_WIN32)
     curl_easy_setopt(curl.get(), CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
 #endif
 
+    // Perform HEAD request to check server metadata
+    struct ServerHeaders {
+        std::string etag;
+        std::string last_modified;
+        std::string accept_ranges;
+    } server_headers;
+
     typedef size_t(*CURLOPT_HEADERFUNCTION_PTR)(char *, size_t, size_t, void *);
     auto header_callback = [](char * buffer, size_t /*size*/, size_t n_items, void * userdata) -> size_t {
-        common_load_model_from_url_headers * headers = (common_load_model_from_url_headers *) userdata;
+        ServerHeaders * headers = static_cast<ServerHeaders *>(userdata);
 
         static std::regex header_regex("([^:]+): (.*)\r\n");
         static std::regex etag_regex("ETag", std::regex_constants::icase);
         static std::regex last_modified_regex("Last-Modified", std::regex_constants::icase);
         static std::regex accept_ranges_regex("Accept-Ranges", std::regex_constants::icase);
+
         std::string header(buffer, n_items);
         std::smatch match;
         if (std::regex_match(header, match, header_regex)) {
@@ -363,150 +412,150 @@ static bool common_download_file_single(const std::string & url, const std::stri
         return n_items;
     };
 
-    curl_easy_setopt(curl.get(), CURLOPT_NOBODY, 1L); // will trigger the HEAD verb
-    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 1L); // hide head request progress
+    curl_easy_setopt(curl.get(), CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, static_cast<CURLOPT_HEADERFUNCTION_PTR>(header_callback));
-    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &headers);
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &server_headers);
 
-    // we only allow retrying once for HEAD requests
-    // this is for the use case of using running offline (no internet), retrying can be annoying
-    bool was_perform_successful = curl_perform_with_retry(url, curl.get(), 1, 0, "HEAD");
-    if (!was_perform_successful) {
-        head_request_ok = false;
-    }
-
+    bool head_request_ok = curl_perform_with_retry(url, curl.get(), 1, 0, "HEAD");
     long http_code = 0;
     curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &http_code);
-    if (http_code == 200) {
-        head_request_ok = true;
-    } else {
-        LOG_WRN("%s: HEAD invalid http status code received: %ld\n", __func__, http_code);
-        head_request_ok = false;
+    head_request_ok = head_request_ok && (http_code == 200);
+
+    if (!head_request_ok) {
+        LOG_WRN("%s: HEAD request failed (code: %ld), proceeding with download anyway\n", __func__, http_code);
     }
 
-    // if head_request_ok is false, we don't have the etag or last-modified headers
-    // we leave should_download as-is, which is true if the file does not exist
+    // Determine if download is needed based on staleness check
+    bool should_download              = !file_exists;
     bool should_download_from_scratch = false;
-    if (head_request_ok) {
-        // check if ETag or Last-Modified headers are different
-        // if it is, we need to download the file again
-        if (!etag.empty() && etag != headers.etag) {
-            LOG_WRN("%s: ETag header is different (%s != %s): triggering a new download\n", __func__, etag.c_str(), headers.etag.c_str());
+
+    if (head_request_ok && file_exists) {
+        // Check for stale download using JSON metadata
+        if (!cached_etag.empty() && cached_etag != server_headers.etag) {
+            LOG_WRN("%s: ETag changed (%s != %s): file is stale, re-downloading\n", __func__, cached_etag.c_str(),
+                    server_headers.etag.c_str());
             should_download = true;
             should_download_from_scratch = true;
-        } else if (!last_modified.empty() && last_modified != headers.last_modified) {
-            LOG_WRN("%s: Last-Modified header is different (%s != %s): triggering a new download\n", __func__, last_modified.c_str(), headers.last_modified.c_str());
+        } else if (!cached_last_modified.empty() && cached_last_modified != server_headers.last_modified) {
+            LOG_WRN("%s: Last-Modified changed (%s != %s): file is stale, re-downloading\n", __func__,
+                    cached_last_modified.c_str(), server_headers.last_modified.c_str());
             should_download = true;
             should_download_from_scratch = true;
+        } else if (!cached_etag.empty() || !cached_last_modified.empty()) {
+            LOG_INF("%s: file is up to date, using cached version\n", __func__);
+            should_download = false;
         }
     }
 
-    const bool accept_ranges_supported = !headers.accept_ranges.empty() && headers.accept_ranges != "none";
-    if (should_download) {
-        if (file_exists && !accept_ranges_supported) {  // Resumable downloads not supported, delete and start again.
-            LOG_WRN("%s: deleting previous downloaded file: %s\n", __func__, path.c_str());
-            if (remove(path.c_str()) != 0) {
-                LOG_ERR("%s: unable to delete file: %s\n", __func__, path.c_str());
+    if (!should_download) {
+        LOG_INF("%s: using cached file: %s\n", __func__, path.c_str());
+        return true;
+    }
+
+    // Prepare for download
+    const bool  supports_ranges = !server_headers.accept_ranges.empty() && server_headers.accept_ranges != "none";
+    std::string path_temporary  = path + ".downloadInProgress";
+
+    // Clean up files if downloading from scratch
+    if (should_download_from_scratch) {
+        if (std::filesystem::exists(path_temporary)) {
+            if (remove(path_temporary.c_str()) != 0) {
+                LOG_ERR("%s: unable to delete temporary file: %s\n", __func__, path_temporary.c_str());
                 return false;
             }
         }
-
-        std::string path_temporary = path + ".downloadInProgress";
-        if (should_download_from_scratch) {
-            if (std::filesystem::exists(path_temporary)) {
-                if (remove(path_temporary.c_str()) != 0) {
-                    LOG_ERR("%s: unable to delete file: %s\n", __func__, path_temporary.c_str());
-                    return false;
-                }
-            }
-
-            if (std::filesystem::exists(path)) {
-                if (remove(path.c_str()) != 0) {
-                    LOG_ERR("%s: unable to delete file: %s\n", __func__, path.c_str());
-                    return false;
-                }
+        if (std::filesystem::exists(path)) {
+            if (remove(path.c_str()) != 0) {
+                LOG_ERR("%s: unable to delete existing file: %s\n", __func__, path.c_str());
+                return false;
             }
         }
-
-        // Set the output file
-
-        struct FILE_deleter {
-            void operator()(FILE * f) const {
-                fclose(f);
-            }
-        };
-
-        // Always open file in append mode could be resuming
-        std::unique_ptr<FILE, FILE_deleter> outfile(fopen(path_temporary.c_str(), "ab"));
-        if (!outfile) {
-            LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path.c_str());
+    } else if (file_exists && !supports_ranges) {
+        // Server doesn't support ranges, must download from scratch
+        LOG_WRN("%s: server doesn't support ranges, deleting existing file\n", __func__);
+        if (remove(path.c_str()) != 0) {
+            LOG_ERR("%s: unable to delete file: %s\n", __func__, path.c_str());
             return false;
         }
-
-        typedef size_t(*CURLOPT_WRITEFUNCTION_PTR)(void * data, size_t size, size_t nmemb, void * fd);
-        auto write_callback = [](void * data, size_t size, size_t nmemb, void * fd) -> size_t {
-            return fwrite(data, size, nmemb, (FILE *)fd);
-        };
-        curl_easy_setopt(curl.get(), CURLOPT_NOBODY, 0L);
-        curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, static_cast<CURLOPT_WRITEFUNCTION_PTR>(write_callback));
-        curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, outfile.get());
-
-        //  display download progress
-        curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
-
-        // helper function to hide password in URL
-        auto llama_download_hide_password_in_url = [](const std::string & url) -> std::string {
-            std::size_t protocol_pos = url.find("://");
-            if (protocol_pos == std::string::npos) {
-                return url;  // Malformed URL
-            }
-
-            std::size_t at_pos = url.find('@', protocol_pos + 3);
-            if (at_pos == std::string::npos) {
-                return url;  // No password in URL
-            }
-
-            return url.substr(0, protocol_pos + 3) + "********" + url.substr(at_pos);
-        };
-
-        // start the download
-        LOG_INF("%s: trying to download model from %s to %s (server_etag:%s, server_last_modified:%s)...\n", __func__,
-            llama_download_hide_password_in_url(url).c_str(), path.c_str(), headers.etag.c_str(), headers.last_modified.c_str());
-
-        // Write the updated JSON metadata file.
-        metadata.update({
-            {"url", url},
-            {"etag", headers.etag},
-            {"lastModified", headers.last_modified}
-        });
-        write_file(metadata_path, metadata.dump(4));
-        LOG_DBG("%s: file metadata saved: %s\n", __func__, metadata_path.c_str());
-
-        const bool was_perform_successful =
-            curl_perform_with_retry(url, curl.get(), CURL_MAX_RETRY, CURL_RETRY_DELAY_SECONDS, "GET",
-                                    headers.accept_ranges.empty() ? "" : path_temporary);
-        if (!was_perform_successful) {
-            return false;
-        }
-
-        long http_code = 0;
-        curl_easy_getinfo (curl.get(), CURLINFO_RESPONSE_CODE, &http_code);
-        if (http_code < 200 || http_code >= 400) {
-            LOG_ERR("%s: invalid http status code received: %ld\n", __func__, http_code);
-            return false;
-        }
-
-        // Causes file to be closed explicitly here before we rename it.
-        outfile.reset();
-
-        if (rename(path_temporary.c_str(), path.c_str()) != 0) {
-            LOG_ERR("%s: unable to rename file: %s to %s\n", __func__, path_temporary.c_str(), path.c_str());
-            return false;
-        }
-    } else {
-        LOG_INF("%s: using cached file: %s\n", __func__, path.c_str());
     }
 
+    // Open output file for writing/appending
+    struct FILE_deleter {
+        void operator()(FILE * f) const {
+            if (f) {
+                fclose(f);
+            }
+        }
+    };
+
+    std::unique_ptr<FILE, FILE_deleter> outfile(fopen(path_temporary.c_str(), "ab"));
+    if (!outfile) {
+        LOG_ERR("%s: error opening temporary file for writing: %s\n", __func__, path_temporary.c_str());
+        return false;
+    }
+
+    // Setup CURL for download
+    typedef size_t (*CURLOPT_WRITEFUNCTION_PTR)(void * data, size_t size, size_t nmemb, void * fd);
+    auto write_callback = [](void * data, size_t size, size_t nmemb, void * fd) -> size_t {
+        return fwrite(data, size, nmemb, static_cast<FILE *>(fd));
+    };
+
+    curl_easy_setopt(curl.get(), CURLOPT_NOBODY, 0L);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, static_cast<CURLOPT_WRITEFUNCTION_PTR>(write_callback));
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, outfile.get());
+    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+
+    // Helper function to hide password in URL
+    auto hide_password_in_url = [](const std::string & url) -> std::string {
+        std::size_t protocol_pos = url.find("://");
+        if (protocol_pos == std::string::npos) {
+            return url;
+        }
+        std::size_t at_pos = url.find('@', protocol_pos + 3);
+        if (at_pos == std::string::npos) {
+            return url;
+        }
+        return url.substr(0, protocol_pos + 3) + "********" + url.substr(at_pos);
+    };
+
+    LOG_INF("%s: downloading from %s to %s (etag:%s, last-modified:%s, ranges:%s)\n", __func__,
+            hide_password_in_url(url).c_str(), path.c_str(), server_headers.etag.c_str(),
+            server_headers.last_modified.c_str(), supports_ranges ? "yes" : "no");
+
+    // Save metadata before starting download
+    metadata = {
+        { "url",          url                          },
+        { "etag",         server_headers.etag          },
+        { "lastModified", server_headers.last_modified }
+    };
+    write_file(metadata_path, metadata.dump(4));
+    LOG_DBG("%s: metadata saved: %s\n", __func__, metadata_path.c_str());
+
+    // Perform the download with retry and range support
+    const bool download_success = curl_perform_with_retry(url, curl.get(), CURL_MAX_RETRY, CURL_RETRY_DELAY_SECONDS,
+                                                          "GET", supports_ranges ? path_temporary : "");
+    if (!download_success) {
+        return false;
+    }
+
+    // Verify HTTP response code
+    http_code = 0;
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &http_code);
+    if (http_code < 200 || http_code >= 400) {
+        LOG_ERR("%s: invalid HTTP status code: %ld\n", __func__, http_code);
+        return false;
+    }
+
+    // Close file and rename to final location
+    outfile.reset();
+
+    if (rename(path_temporary.c_str(), path.c_str()) != 0) {
+        LOG_ERR("%s: unable to rename %s to %s\n", __func__, path_temporary.c_str(), path.c_str());
+        return false;
+    }
+
+    LOG_INF("%s: download completed successfully: %s\n", __func__, path.c_str());
     return true;
 }
 
