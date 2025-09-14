@@ -25,6 +25,7 @@
 #include <cstdarg>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <list>
 #include <regex>
 #include <set>
