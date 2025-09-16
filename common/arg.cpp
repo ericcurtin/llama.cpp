@@ -62,12 +62,25 @@ static void write_file(const std::string & fname, const std::string & content) {
     if (!file) {
         throw std::runtime_error(string_format("error: failed to open file '%s'\n", fname.c_str()));
     }
-    file << content;
-    file.close();
 
-    // Makes write atomic
-    if (rename(fname_tmp.c_str(), fname.c_str()) != 0) {
-        LOG_ERR("%s: unable to rename file: %s to %s\n", __func__, fname_tmp.c_str(), fname.c_str());
+    try {
+        file << content;
+        file.close();
+
+        // Makes write atomic
+        if (rename(fname_tmp.c_str(), fname.c_str()) != 0) {
+            LOG_ERR("%s: unable to rename file: %s to %s\n", __func__, fname_tmp.c_str(), fname.c_str());
+            // If rename fails, try to delete the temporary file
+            if (remove(fname_tmp.c_str()) != 0) {
+                LOG_ERR("%s: unable to delete temporary file: %s\n", __func__, fname_tmp.c_str());
+            }
+        }
+    } catch (...) {
+        // If anything fails, try to delete the temporary file
+        if (remove(fname_tmp.c_str()) != 0) {
+            LOG_ERR("%s: unable to delete temporary file: %s\n", __func__, fname_tmp.c_str());
+        }
+        throw;  // Re-throw the original exception
     }
 }
 
@@ -272,17 +285,19 @@ static size_t common_write_callback(void * data, size_t size, size_t nmemb, void
 
 // helper function to hide password in URL
 static std::string llama_download_hide_password_in_url(const std::string & url) {
-    std::size_t protocol_pos = url.find("://");
-    if (protocol_pos == std::string::npos) {
-        return url;  // Malformed URL
+    // Use regex to match and replace the user[:password]@ pattern in URLs
+    // Pattern: scheme://[user[:password]@]host[...]
+    static const std::regex url_regex(R"(^(https?://)([^/@]+@)(.*)$)");
+    std::smatch             match;
+
+    if (std::regex_match(url, match, url_regex)) {
+        // match[1] = scheme (e.g., "https://")
+        // match[2] = user[:password]@ part
+        // match[3] = rest of URL (host and path)
+        return match[1].str() + "********@" + match[3].str();
     }
 
-    std::size_t at_pos = url.find('@', protocol_pos + 3);
-    if (at_pos == std::string::npos) {
-        return url;  // No password in URL
-    }
-
-    return url.substr(0, protocol_pos + 3) + "********" + url.substr(at_pos);
+    return url;  // No credentials found or malformed URL
 }
 
 static void common_curl_easy_setopt_head(CURL * curl, const std::string & url) {
