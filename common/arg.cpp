@@ -402,25 +402,40 @@ static bool common_download_file_multiconn(const std::string & url,
                                            const std::string & bearer_token,
                                            long content_length,
                                            int num_connections = 4) {
-    // Minimum chunk size (1MB) - don't use multi-connection for small files
-    const long min_chunk_size = 1024 * 1024;
-    const long chunk_size = content_length / num_connections;
+    // Minimum chunk size (2MB) - don't use multi-connection for small files
+    const long min_chunk_size = 2 * 1024 * 1024;
+    const long min_file_size = min_chunk_size * 2; // Minimum file size to enable multi-connection
     
-    if (chunk_size < min_chunk_size) {
-        // File is too small for multi-connection download
+    if (content_length < min_file_size) {
+        LOG_DBG("%s: file too small (%ld bytes) for multi-connection download\n", __func__, content_length);
         return false;
     }
     
-    LOG_INF("%s: starting multi-connection download with %d connections for %ld bytes\n", 
-            __func__, num_connections, content_length);
+    // Adjust number of connections based on file size
+    const long chunk_size = content_length / num_connections;
+    if (chunk_size < min_chunk_size) {
+        num_connections = static_cast<int>(content_length / min_chunk_size);
+        if (num_connections < 2) {
+            LOG_DBG("%s: adjusted connection count results in less than 2 connections\n", __func__);
+            return false;
+        }
+    }
+    
+    LOG_INF("%s: starting multi-connection download with %d connections for %ld bytes (chunk size: %ld)\n", 
+            __func__, num_connections, content_length, content_length / num_connections);
     
     std::vector<common_download_chunk> chunks;
     std::vector<std::future<bool>> futures;
     
     // Create chunk files and prepare for download
     for (int i = 0; i < num_connections; ++i) {
-        long start = i * chunk_size;
-        long end = (i == num_connections - 1) ? content_length - 1 : (start + chunk_size - 1);
+        long start = static_cast<long>(i) * (content_length / num_connections);
+        long end;
+        if (i == num_connections - 1) {
+            end = content_length - 1;
+        } else {
+            end = start + (content_length / num_connections) - 1;
+        }
         
         std::string chunk_path = path + ".downloadInProgress.chunk" + std::to_string(i);
         chunks.emplace_back(url, bearer_token, chunk_path, start, end);
@@ -443,6 +458,7 @@ static bool common_download_file_multiconn(const std::string & url,
             if (std::filesystem::exists(chunk.path_temporary)) {
                 resume_from = std::filesystem::file_size(chunk.path_temporary);
                 chunk.downloaded_bytes = resume_from;
+                LOG_DBG("%s: resuming chunk %zu from byte %ld\n", __func__, chunk_idx, resume_from);
             }
             
             // Open chunk file for writing
@@ -458,6 +474,7 @@ static bool common_download_file_multiconn(const std::string & url,
             curl_easy_setopt(chunk.curl, CURLOPT_FOLLOWLOCATION, 1L);
             curl_easy_setopt(chunk.curl, CURLOPT_WRITEDATA, chunk.file);
             curl_easy_setopt(chunk.curl, CURLOPT_WRITEFUNCTION, common_write_callback);
+            curl_easy_setopt(chunk.curl, CURLOPT_NOPROGRESS, 1L); // Disable progress per chunk
             
             // Set range for this chunk
             long actual_start = chunk.start_byte + resume_from;
@@ -471,6 +488,7 @@ static bool common_download_file_multiconn(const std::string & url,
                 chunk.completed = true;
                 fclose(chunk.file);
                 curl_easy_cleanup(chunk.curl);
+                LOG_DBG("%s: chunk %zu already completed\n", __func__, chunk_idx);
                 return true;
             }
             
@@ -497,35 +515,42 @@ static bool common_download_file_multiconn(const std::string & url,
                 if (http_code < 200 || http_code >= 400) {
                     LOG_ERR("%s: chunk %zu failed with HTTP code %ld\n", __func__, chunk_idx, http_code);
                     success = false;
+                } else {
+                    LOG_DBG("%s: chunk %zu completed successfully (HTTP %ld)\n", __func__, chunk_idx, http_code);
                 }
             } else {
                 LOG_ERR("%s: chunk %zu failed: %s\n", __func__, chunk_idx, curl_easy_strerror(res));
             }
             
             // Cleanup
-            curl_slist_free_all(headers);
+            if (headers) {
+                curl_slist_free_all(headers);
+            }
             fclose(chunk.file);
             curl_easy_cleanup(chunk.curl);
             
-            if (success) {
-                chunk.completed = true;
-                LOG_DBG("%s: chunk %zu completed successfully\n", __func__, chunk_idx);
-            }
-            
+            chunk.completed = success;
             return success;
         }, i));
     }
     
     // Wait for all chunks to complete
     bool all_success = true;
-    for (auto & future : futures) {
-        if (!future.get()) {
+    for (size_t i = 0; i < futures.size(); ++i) {
+        if (!futures[i].get()) {
+            LOG_ERR("%s: chunk %zu failed\n", __func__, i);
             all_success = false;
         }
     }
     
     if (!all_success) {
         LOG_ERR("%s: one or more chunks failed to download\n", __func__);
+        // Clean up any partial chunk files
+        for (const auto & chunk : chunks) {
+            if (std::filesystem::exists(chunk.path_temporary)) {
+                std::filesystem::remove(chunk.path_temporary);
+            }
+        }
         return false;
     }
     
@@ -537,18 +562,31 @@ static bool common_download_file_multiconn(const std::string & url,
         return false;
     }
     
+    LOG_INF("%s: combining %zu chunks into final file\n", __func__, chunks.size());
     for (size_t i = 0; i < chunks.size(); ++i) {
         std::ifstream chunk_file(chunks[i].path_temporary, std::ios::binary);
         if (!chunk_file) {
             LOG_ERR("%s: failed to open chunk file %s for combining\n", __func__, chunks[i].path_temporary.c_str());
+            final_file.close();
+            std::filesystem::remove(path_temporary);
             return false;
         }
         
+        // Copy chunk to final file
         final_file << chunk_file.rdbuf();
         chunk_file.close();
         
-        // Remove chunk file
+        // Verify chunk was written properly
+        if (final_file.fail()) {
+            LOG_ERR("%s: failed to write chunk %zu to final file\n", __func__, i);
+            final_file.close();
+            std::filesystem::remove(path_temporary);
+            return false;
+        }
+        
+        // Remove chunk file after successful combination
         std::filesystem::remove(chunks[i].path_temporary);
+        LOG_DBG("%s: combined and removed chunk %zu\n", __func__, i);
     }
     
     final_file.close();
@@ -691,10 +729,13 @@ static bool common_download_file_single(const std::string & url,
             
             // Try multi-connection download if conditions are met
             if (accept_ranges_supported && headers.content_length > 0 && should_download_from_scratch) {
+                LOG_INF("%s: server supports range requests with content length %ld bytes\n", __func__, headers.content_length);
+                
                 // Store chunk info in metadata for progress tracking
                 metadata["multiconn"] = {
                     {"content_length", headers.content_length},
-                    {"chunks_used", true}
+                    {"chunks_used", true},
+                    {"attempt_time", std::time(nullptr)}
                 };
                 write_file(metadata_path, metadata.dump(4));
                 
@@ -705,7 +746,23 @@ static bool common_download_file_single(const std::string & url,
                     // Remove failed chunk metadata
                     metadata.erase("multiconn");
                     write_file(metadata_path, metadata.dump(4));
+                    
+                    // Clean up any remaining chunk files
+                    try {
+                        for (int i = 0; i < 10; ++i) { // Check up to 10 possible chunks
+                            std::string chunk_path = path + ".downloadInProgress.chunk" + std::to_string(i);
+                            if (std::filesystem::exists(chunk_path)) {
+                                std::filesystem::remove(chunk_path);
+                                LOG_DBG("%s: cleaned up chunk file %s\n", __func__, chunk_path.c_str());
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_WRN("%s: error cleaning up chunk files: %s\n", __func__, e.what());
+                    }
                 }
+            } else {
+                LOG_DBG("%s: multi-connection download not attempted: accept_ranges=%d, content_length=%ld, from_scratch=%d\n",
+                        __func__, accept_ranges_supported ? 1 : 0, headers.content_length, should_download_from_scratch ? 1 : 0);
             }
             
             // Fall back to single-connection download if multi-connection failed or wasn't attempted
