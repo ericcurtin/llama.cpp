@@ -56,14 +56,18 @@ add_library(${TARGET} STATIC
     common.h
     console.cpp
     console.h
+    enhanced-scheduler.h
     json-partial.cpp
     json-partial.h
     json-schema-to-grammar.cpp
     llguidance.cpp
     log.cpp
     log.h
+    memory-pool.h
     ngram-cache.cpp
     ngram-cache.h
+    optimal-batcher.h
+    performance-monitor.h
     regex-partial.cpp
     regex-partial.h
     sampling.cpp
