@@ -261,6 +261,7 @@ struct cmd_params {
     std::vector<bool>                use_mmap;
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
+    std::vector<int>                 n_cache_reuse;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -298,6 +299,7 @@ static const cmd_params cmd_params_defaults = {
     /* use_mmap             */ { true },
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
+    /* n_cache_reuse        */ { 0 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -377,6 +379,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
     printf("                                            (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>              (default: 0)\n");
+    printf("  --cache-reuse <n>                         min chunk size to attempt reusing from the cache via KV shifting\n");
+    printf("                                            (default: %s)\n",
+           join(cmd_params_defaults.n_cache_reuse, ",").c_str());
+    printf("                                            (env: LLAMA_ARG_CACHE_REUSE)\n");
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -664,6 +670,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_op_offload.insert(params.no_op_offload.end(), p.begin(), p.end());
+            } else if (arg == "--cache-reuse") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.n_cache_reuse.insert(params.n_cache_reuse.end(), p.begin(), p.end());
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -885,6 +898,16 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.no_op_offload.empty()) {
         params.no_op_offload = cmd_params_defaults.no_op_offload;
     }
+    if (params.n_cache_reuse.empty()) {
+        params.n_cache_reuse = cmd_params_defaults.n_cache_reuse;
+    }
+
+    // apply environment variables
+    const char * env_cache_reuse = getenv("LLAMA_ARG_CACHE_REUSE");
+    if (env_cache_reuse && params.n_cache_reuse == cmd_params_defaults.n_cache_reuse) {
+        params.n_cache_reuse = { std::stoi(env_cache_reuse) };
+    }
+
     if (params.n_threads.empty()) {
         params.n_threads = cmd_params_defaults.n_threads;
     }
@@ -926,6 +949,7 @@ struct cmd_params_instance {
     bool               use_mmap;
     bool               embeddings;
     bool               no_op_offload;
+    int                n_cache_reuse;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1068,6 +1092,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & mmp : params.use_mmap)
     for (const auto & embd : params.embeddings)
     for (const auto & nopo : params.no_op_offload)
+    for (const auto & ncr : params.n_cache_reuse)
     for (const auto & nb : params.n_batch)
     for (const auto & nub : params.n_ubatch)
     for (const auto & tk : params.type_k)
@@ -1108,6 +1133,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
+                /* .n_cache_reuse= */ ncr,
             };
             instances.push_back(instance);
         }
@@ -1141,6 +1167,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
+                /* .n_cache_reuse= */ ncr,
             };
             instances.push_back(instance);
         }
@@ -1174,6 +1201,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
+                /* .n_cache_reuse= */ ncr,
             };
             instances.push_back(instance);
         }
