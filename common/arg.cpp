@@ -827,16 +827,25 @@ static std::string common_docker_get_credentials() {
 #endif
     }
 
-    std::string   config_path = std::string(home) + "/.docker/config.json";
-    std::ifstream config_file(config_path);
+    std::filesystem::path config_path = std::filesystem::path(home) / ".docker" / "config.json";
+    std::ifstream         config_file(config_path);
     if (!config_file.is_open()) {
         return "";
     }
 
     try {
+        // Check file size to prevent memory exhaustion (Docker config should be small)
+        config_file.seekg(0, std::ios::end);
+        const auto file_size = config_file.tellg();
+        config_file.seekg(0, std::ios::beg);
+
+        if (file_size > 1024 * 1024) {  // Limit to 1MB
+            LOG_DBG("%s: Docker config file too large: %ld bytes\n", __func__, static_cast<long>(file_size));
+            return "";
+        }
+
         nlohmann::ordered_json config;
         config_file >> config;
-        config_file.close();
 
         // Docker Hub registry can be listed as "https://index.docker.io/v1/" or similar
         std::vector<std::string> registry_urls = {
@@ -854,7 +863,7 @@ static std::string common_docker_get_credentials() {
             }
         }
     } catch (const std::exception & e) {
-        LOG_DBG("%s: Failed to parse Docker config: %s\n", __func__, e.what());
+        LOG_DBG("%s: Failed to parse Docker config at %s: %s\n", __func__, config_path.string().c_str(), e.what());
     }
 
     return "";
