@@ -813,11 +813,65 @@ std::pair<long, std::vector<char>> common_remote_get_content(const std::string &
 // Docker registry functions
 //
 
+// Read Docker credentials from ~/.docker/config.json
+static std::string common_docker_get_credentials() {
+    const char * home = std::getenv("HOME");
+    if (!home) {
+#ifdef _WIN32
+        home = std::getenv("USERPROFILE");
+        if (!home) {
+            return "";
+        }
+#else
+        return "";
+#endif
+    }
+
+    std::string   config_path = std::string(home) + "/.docker/config.json";
+    std::ifstream config_file(config_path);
+    if (!config_file.is_open()) {
+        return "";
+    }
+
+    try {
+        nlohmann::ordered_json config;
+        config_file >> config;
+        config_file.close();
+
+        // Docker Hub registry can be listed as "https://index.docker.io/v1/" or similar
+        std::vector<std::string> registry_urls = {
+            "https://index.docker.io/v1/",
+            "index.docker.io",
+            "docker.io",
+        };
+
+        for (const auto & registry_url : registry_urls) {
+            if (config.contains("auths") && config["auths"].contains(registry_url)) {
+                const auto & auth_entry = config["auths"][registry_url];
+                if (auth_entry.contains("auth") && auth_entry["auth"].is_string()) {
+                    return auth_entry["auth"].get<std::string>();
+                }
+            }
+        }
+    } catch (const std::exception & e) {
+        LOG_DBG("%s: Failed to parse Docker config: %s\n", __func__, e.what());
+    }
+
+    return "";
+}
+
 static std::string common_docker_get_token(const std::string & repo) {
     std::string url = "https://auth.docker.io/token?service=registry.docker.io&scope=repository:" + repo + ":pull";
 
     common_remote_params params;
-    auto                 res = common_remote_get_content(url, params);
+
+    // Add Docker credentials if available
+    std::string credentials = common_docker_get_credentials();
+    if (!credentials.empty()) {
+        params.headers.push_back("Authorization: Basic " + credentials);
+    }
+
+    auto res = common_remote_get_content(url, params);
 
     if (res.first != 200) {
         throw std::runtime_error("Failed to get Docker registry token, HTTP code: " + std::to_string(res.first));
