@@ -99,6 +99,13 @@ if (GO_EXECUTABLE)
 
     target_include_directories(${TARGET} PRIVATE ${OCI_GO_DIR})
     set(LLAMA_COMMON_EXTRA_LIBS build_info ${OCI_LIB})
+    
+    # On macOS, the Go runtime requires CoreFoundation and Security frameworks
+    if (APPLE)
+        find_library(CORE_FOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+        find_library(SECURITY_FRAMEWORK Security REQUIRED)
+        set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ${CORE_FOUNDATION_FRAMEWORK} ${SECURITY_FRAMEWORK})
+    endif()
 else()
     message(WARNING "Go compiler not found. OCI functionality will not be available.")
     set(LLAMA_COMMON_EXTRA_LIBS build_info)
