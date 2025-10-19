@@ -20,6 +20,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"golang.org/x/term"
 )
 
 // OCIError represents an error that occurred during OCI operations
@@ -120,28 +121,74 @@ func (pw *progressWriter) printProgress() {
 		shortDigest = shortDigest[7:19]
 	}
 
+	// Get terminal width, default to 80 if cannot be determined
+	termWidth := 80
+	if width, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && width > 0 {
+		termWidth = width
+	}
+
 	// Print docker-style progress
 	if pw.total > 0 {
-		fmt.Fprintf(os.Stderr, "\r%s: Downloading [", shortDigest)
+		// Build the progress message to measure its length
+		// Format: "shortDigest: Downloading [] 100.0% (9999.99 MB / 9999.99 MB) 999.99 MB/s"
+		prefix := fmt.Sprintf("%s: Downloading [", shortDigest)
+		suffix := fmt.Sprintf("] %.1f%% (%.2f MB / %.2f MB) %.2f MB/s",
+			percentage, downloadedMB, totalMB, speed)
 
-		// Progress bar (50 chars wide)
-		barWidth := 50
-		filled := int(float64(barWidth) * percentage / 100.0)
-		for i := 0; i < barWidth; i++ {
+		// Calculate available space for progress bar
+		// Reserve at least 10 chars for the bar, use remaining space up to 50 chars
+		fixedWidth := len(prefix) + len(suffix)
+		maxBarWidth := termWidth - fixedWidth
+		if maxBarWidth < 10 {
+			maxBarWidth = 10
+		} else if maxBarWidth > 50 {
+			maxBarWidth = 50
+		}
+
+		// Build the complete line
+		var line strings.Builder
+		line.WriteString("\r")
+		line.WriteString(prefix)
+
+		// Progress bar
+		filled := int(float64(maxBarWidth) * percentage / 100.0)
+		for i := 0; i < maxBarWidth; i++ {
 			if i < filled {
-				fmt.Fprint(os.Stderr, "=")
+				line.WriteString("=")
 			} else if i == filled {
-				fmt.Fprint(os.Stderr, ">")
+				line.WriteString(">")
 			} else {
-				fmt.Fprint(os.Stderr, " ")
+				line.WriteString(" ")
 			}
 		}
 
-		fmt.Fprintf(os.Stderr, "] %.1f%% (%.2f MB / %.2f MB) %.2f MB/s",
-			percentage, downloadedMB, totalMB, speed)
+		line.WriteString(suffix)
+
+		// Pad with spaces to clear any trailing characters from previous output
+		currentLen := len(prefix) + maxBarWidth + len(suffix)
+		if currentLen < termWidth {
+			padding := termWidth - currentLen
+			for i := 0; i < padding; i++ {
+				line.WriteString(" ")
+			}
+		}
+
+		// Write the complete line
+		fmt.Fprint(os.Stderr, line.String())
 	} else {
-		fmt.Fprintf(os.Stderr, "\r%s: Downloading %.2f MB %.2f MB/s",
+		// Build line for unknown total size
+		line := fmt.Sprintf("\r%s: Downloading %.2f MB %.2f MB/s",
 			shortDigest, downloadedMB, speed)
+
+		// Pad with spaces to clear trailing characters
+		if len(line) < termWidth {
+			padding := termWidth - len(line)
+			for i := 0; i < padding; i++ {
+				line += " "
+			}
+		}
+
+		fmt.Fprint(os.Stderr, line)
 	}
 }
 

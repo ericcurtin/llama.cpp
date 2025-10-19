@@ -1,8 +1,13 @@
 module github.com/ericcurtin/llama.cpp/oci-go
 
-go 1.24
+go 1.24.0
 
-require github.com/google/go-containerregistry v0.20.6
+toolchain go1.24.9
+
+require (
+	github.com/google/go-containerregistry v0.20.6
+	golang.org/x/term v0.36.0
+)
 
 require (
 	github.com/containerd/stargz-snapshotter/estargz v0.16.3 // indirect
@@ -17,5 +22,5 @@ require (
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/vbatts/tar-split v0.12.1 // indirect
 	golang.org/x/sync v0.15.0 // indirect
-	golang.org/x/sys v0.33.0 // indirect
+	golang.org/x/sys v0.37.0 // indirect
 )
