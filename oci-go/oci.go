@@ -84,7 +84,7 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 	n, err := pw.writer.Write(p)
 	if n > 0 {
 		atomic.AddInt64(&pw.downloaded, int64(n))
-		
+
 		// Update progress display every 100ms
 		now := time.Now()
 		if now.Sub(pw.lastPrint) >= 100*time.Millisecond {
@@ -97,33 +97,33 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 
 func (pw *progressWriter) printProgress() {
 	downloaded := atomic.LoadInt64(&pw.downloaded)
-	
+
 	// Calculate percentage and download speed
 	var percentage float64
 	if pw.total > 0 {
 		percentage = float64(downloaded) / float64(pw.total) * 100.0
 	}
-	
+
 	elapsed := time.Since(pw.startTime).Seconds()
 	speed := float64(0)
 	if elapsed > 0 {
 		speed = float64(downloaded) / elapsed / (1024 * 1024) // MB/s
 	}
-	
+
 	// Format sizes
 	downloadedMB := float64(downloaded) / (1024 * 1024)
 	totalMB := float64(pw.total) / (1024 * 1024)
-	
+
 	// Get short digest (first 12 chars after sha256:)
 	shortDigest := pw.layerDigest
 	if strings.HasPrefix(shortDigest, "sha256:") {
 		shortDigest = shortDigest[7:19]
 	}
-	
+
 	// Print docker-style progress
 	if pw.total > 0 {
 		fmt.Fprintf(os.Stderr, "\r%s: Downloading [", shortDigest)
-		
+
 		// Progress bar (50 chars wide)
 		barWidth := 50
 		filled := int(float64(barWidth) * percentage / 100.0)
@@ -136,11 +136,11 @@ func (pw *progressWriter) printProgress() {
 				fmt.Fprint(os.Stderr, " ")
 			}
 		}
-		
-		fmt.Fprintf(os.Stderr, "] %.1f%% (%.2f MB / %.2f MB) %.2f MB/s", 
+
+		fmt.Fprintf(os.Stderr, "] %.1f%% (%.2f MB / %.2f MB) %.2f MB/s",
 			percentage, downloadedMB, totalMB, speed)
 	} else {
-		fmt.Fprintf(os.Stderr, "\r%s: Downloading %.2f MB %.2f MB/s", 
+		fmt.Fprintf(os.Stderr, "\r%s: Downloading %.2f MB %.2f MB/s",
 			shortDigest, downloadedMB, speed)
 	}
 }
@@ -148,13 +148,13 @@ func (pw *progressWriter) printProgress() {
 func (pw *progressWriter) finish() {
 	downloaded := atomic.LoadInt64(&pw.downloaded)
 	downloadedMB := float64(downloaded) / (1024 * 1024)
-	
+
 	// Get short digest
 	shortDigest := pw.layerDigest
 	if strings.HasPrefix(shortDigest, "sha256:") {
 		shortDigest = shortDigest[7:19]
 	}
-	
+
 	fmt.Fprintf(os.Stderr, "\r%s: Download complete (%.2f MB)\n", shortDigest, downloadedMB)
 }
 
@@ -241,7 +241,7 @@ func pullModel(imageRef, cacheDir string) (*OCIResult, error) {
 			existingSize = fileInfo.Size()
 			if existingSize > 0 && existingSize < layerSize {
 				resuming = true
-				fmt.Fprintf(os.Stderr, "%s: Resuming download from %.2f MB\n", 
+				fmt.Fprintf(os.Stderr, "%s: Resuming download from %.2f MB\n",
 					ggufDigest[7:19], float64(existingSize)/(1024*1024))
 			}
 		} else {
@@ -292,7 +292,7 @@ func pullModel(imageRef, cacheDir string) (*OCIResult, error) {
 	// Copy the data with progress tracking
 	_, err = io.Copy(pw, layerReader)
 	outFile.Close()
-	
+
 	if err != nil {
 		// Don't remove partial file on error - allow resume
 		return nil, fmt.Errorf("failed to write layer data: %w", err)
@@ -304,7 +304,7 @@ func pullModel(imageRef, cacheDir string) (*OCIResult, error) {
 	// Verify downloaded file size matches expected
 	if fileInfo, err := os.Stat(tempPath); err == nil {
 		if fileInfo.Size() != layerSize {
-			return nil, fmt.Errorf("downloaded file size (%d) doesn't match expected size (%d)", 
+			return nil, fmt.Errorf("downloaded file size (%d) doesn't match expected size (%d)",
 				fileInfo.Size(), layerSize)
 		}
 	}
