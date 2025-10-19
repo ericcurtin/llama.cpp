@@ -1043,11 +1043,74 @@ static struct common_hf_file_res common_get_hf_file(const std::string & hf_repo_
 // Docker registry functions
 //
 
+// Read Docker credentials from ~/.docker/config.json
+static std::string common_docker_get_credentials() {
+    const char * home = std::getenv("HOME");
+    if (!home) {
+#ifdef _WIN32
+        home = std::getenv("USERPROFILE");
+        if (!home) {
+            return "";
+        }
+#else
+        return "";
+#endif
+    }
+
+    std::filesystem::path config_path = std::filesystem::path(home) / ".docker" / "config.json";
+    std::ifstream         config_file(config_path);
+    if (!config_file.is_open()) {
+        return "";
+    }
+
+    try {
+        // Check file size to prevent memory exhaustion (Docker config should be small)
+        config_file.seekg(0, std::ios::end);
+        const auto file_size = config_file.tellg();
+        config_file.seekg(0, std::ios::beg);
+
+        if (file_size > 1024 * 1024) {  // Limit to 1MB
+            LOG_DBG("%s: Docker config file too large: %ld bytes\n", __func__, static_cast<long>(file_size));
+            return "";
+        }
+
+        nlohmann::ordered_json config;
+        config_file >> config;
+
+        // Docker Hub registry can be listed as "https://index.docker.io/v1/" or similar
+        std::vector<std::string> registry_urls = {
+            "https://index.docker.io/v1/",
+            "index.docker.io",
+            "docker.io",
+        };
+
+        for (const auto & registry_url : registry_urls) {
+            if (config.contains("auths") && config["auths"].contains(registry_url)) {
+                const auto & auth_entry = config["auths"][registry_url];
+                if (auth_entry.contains("auth") && auth_entry["auth"].is_string()) {
+                    return auth_entry["auth"].get<std::string>();
+                }
+            }
+        }
+    } catch (const std::exception & e) {
+        LOG_DBG("%s: Failed to parse Docker config at %s: %s\n", __func__, config_path.string().c_str(), e.what());
+    }
+
+    return "";
+}
+
 static std::string common_docker_get_token(const std::string & repo) {
     std::string url = "https://auth.docker.io/token?service=registry.docker.io&scope=repository:" + repo + ":pull";
 
     common_remote_params params;
-    auto                 res = common_remote_get_content(url, params);
+
+    // Add Docker credentials if available
+    std::string credentials = common_docker_get_credentials();
+    if (!credentials.empty()) {
+        params.headers.push_back("Authorization: Basic " + credentials);
+    }
+
+    auto res = common_remote_get_content(url, params);
 
     if (res.first != 200) {
         throw std::runtime_error("Failed to get Docker registry token, HTTP code: " + std::to_string(res.first));
