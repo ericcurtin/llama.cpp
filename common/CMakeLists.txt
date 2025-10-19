@@ -77,7 +77,40 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
-set(LLAMA_COMMON_EXTRA_LIBS build_info)
+# Build OCI Go library
+find_program(GO_EXECUTABLE go)
+if (GO_EXECUTABLE)
+    set(OCI_GO_DIR ${CMAKE_SOURCE_DIR}/oci-go)
+    set(OCI_LIB ${OCI_GO_DIR}/liboci.a)
+    set(OCI_HEADER ${OCI_GO_DIR}/liboci.h)
+
+    add_custom_command(
+        OUTPUT ${OCI_LIB} ${OCI_HEADER}
+        COMMAND ${GO_EXECUTABLE} build -buildmode=c-archive -o ${OCI_LIB} ${OCI_GO_DIR}/oci.go
+        WORKING_DIRECTORY ${OCI_GO_DIR}
+        DEPENDS ${OCI_GO_DIR}/oci.go ${OCI_GO_DIR}/go.mod
+        COMMENT "Building OCI Go library"
+    )
+
+    add_custom_target(oci_go_lib DEPENDS ${OCI_LIB} ${OCI_HEADER})
+    add_dependencies(${TARGET} oci_go_lib)
+
+    target_include_directories(${TARGET} PRIVATE ${OCI_GO_DIR})
+    target_sources(${TARGET} PRIVATE oci.cpp oci.h)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_OCI)
+    set(LLAMA_COMMON_EXTRA_LIBS build_info ${OCI_LIB})
+
+    # On macOS, the Go runtime requires CoreFoundation and Security frameworks
+    if (APPLE)
+        find_library(OCI_CORE_FOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+        find_library(OCI_SECURITY_FRAMEWORK Security REQUIRED)
+        set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ${OCI_CORE_FOUNDATION_FRAMEWORK} ${OCI_SECURITY_FRAMEWORK})
+    endif()
+else()
+    message(WARNING "Go compiler not found. OCI functionality will not be available.")
+    set(LLAMA_COMMON_EXTRA_LIBS build_info)
+endif()
+
 
 # Use curl to download model url
 if (LLAMA_CURL)
