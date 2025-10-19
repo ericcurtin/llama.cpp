@@ -120,6 +120,9 @@ if (GO_EXECUTABLE AND GO_VERSION_OK)
     add_custom_command(
         OUTPUT ${OCI_LIB} ${OCI_HEADER}
         COMMAND ${GO_EXECUTABLE} build -buildmode=c-archive -o ${OCI_LIB} ${OCI_GO_DIR}/oci.go
+        # Patch the generated header to fix clang compatibility on Windows
+        COMMAND ${CMAKE_COMMAND} -E echo "Patching liboci.h for clang compatibility"
+        COMMAND ${CMAKE_COMMAND} -DHEADER_FILE=${OCI_HEADER} -P ${CMAKE_CURRENT_SOURCE_DIR}/patch_liboci_header.cmake
         WORKING_DIRECTORY ${OCI_GO_DIR}
         DEPENDS ${OCI_GO_DIR}/oci.go ${OCI_GO_DIR}/go.mod
         COMMENT "Building OCI Go library"
