@@ -81,6 +81,7 @@ endif()
 find_program(GO_EXECUTABLE go)
 if (GO_EXECUTABLE)
     # Check Go version - we need at least 1.21 for toolchain directive support
+    set(GO_VERSION_RESULT 1)
     execute_process(
         COMMAND ${GO_EXECUTABLE} version
         OUTPUT_VARIABLE GO_VERSION_OUTPUT
