@@ -40,6 +40,9 @@ func PullOCIModel(imageRef, cacheDir *C.char) *C.char {
 
 	result, err := pullModel(goImageRef, goCacheDir)
 	if err != nil {
+		if result == nil {
+			result = &OCIResult{}
+		}
 		result.Error = &OCIError{
 			Code:    1,
 			Message: err.Error(),
