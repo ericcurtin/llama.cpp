@@ -80,6 +80,39 @@ endif()
 # Build OCI Go library
 find_program(GO_EXECUTABLE go)
 if (GO_EXECUTABLE)
+    # Check Go version - we need at least 1.21 for toolchain directive support
+    set(GO_VERSION_RESULT 1)
+    execute_process(
+        COMMAND ${GO_EXECUTABLE} version
+        OUTPUT_VARIABLE GO_VERSION_OUTPUT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE GO_VERSION_RESULT
+    )
+    
+    if (GO_VERSION_RESULT EQUAL 0)
+        # Extract version number from "go version go1.X.Y ..." or "go version go1.X ..."
+        string(REGEX MATCH "go([0-9]+)\\.([0-9]+)" GO_VERSION_MATCH "${GO_VERSION_OUTPUT}")
+        if (GO_VERSION_MATCH)
+            set(GO_VERSION_MAJOR ${CMAKE_MATCH_1})
+            set(GO_VERSION_MINOR ${CMAKE_MATCH_2})
+            
+            if (GO_VERSION_MAJOR LESS 1 OR (GO_VERSION_MAJOR EQUAL 1 AND GO_VERSION_MINOR LESS 21))
+                message(WARNING "Go version ${GO_VERSION_MAJOR}.${GO_VERSION_MINOR} is too old. OCI functionality requires Go 1.21 or later. OCI functionality will not be available.")
+                set(GO_VERSION_OK FALSE)
+            else()
+                set(GO_VERSION_OK TRUE)
+            endif()
+        else()
+            message(WARNING "Unable to parse Go version from: ${GO_VERSION_OUTPUT}. OCI functionality will not be available.")
+            set(GO_VERSION_OK FALSE)
+        endif()
+    else()
+        message(WARNING "Failed to get Go version. OCI functionality will not be available.")
+        set(GO_VERSION_OK FALSE)
+    endif()
+endif()
+
+if (GO_EXECUTABLE AND GO_VERSION_OK)
     set(OCI_GO_DIR ${CMAKE_SOURCE_DIR}/oci-go)
     set(OCI_LIB ${OCI_GO_DIR}/liboci.a)
     set(OCI_HEADER ${OCI_GO_DIR}/liboci.h)
@@ -107,7 +140,9 @@ if (GO_EXECUTABLE)
         set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ${OCI_CORE_FOUNDATION_FRAMEWORK} ${OCI_SECURITY_FRAMEWORK})
     endif()
 else()
-    message(WARNING "Go compiler not found. OCI functionality will not be available.")
+    if (NOT GO_EXECUTABLE)
+        message(WARNING "Go compiler not found. OCI functionality will not be available.")
+    endif()
     set(LLAMA_COMMON_EXTRA_LIBS build_info)
 endif()
 
