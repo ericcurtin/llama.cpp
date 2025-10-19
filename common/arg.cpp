@@ -5,6 +5,7 @@
 #include "gguf.h" // for reading GGUF splits
 #include "json-schema-to-grammar.h"
 #include "log.h"
+#include "oci.h"
 #include "sampling.h"
 
 // fix problem with std::min and std::max
@@ -1043,116 +1044,41 @@ static struct common_hf_file_res common_get_hf_file(const std::string & hf_repo_
 // Docker registry functions
 //
 
-static std::string common_docker_get_token(const std::string & repo) {
-    std::string url = "https://auth.docker.io/token?service=registry.docker.io&scope=repository:" + repo + ":pull";
-
-    common_remote_params params;
-    auto                 res = common_remote_get_content(url, params);
-
-    if (res.first != 200) {
-        throw std::runtime_error("Failed to get Docker registry token, HTTP code: " + std::to_string(res.first));
-    }
-
-    std::string            response_str(res.second.begin(), res.second.end());
-    nlohmann::ordered_json response = nlohmann::ordered_json::parse(response_str);
-
-    if (!response.contains("token")) {
-        throw std::runtime_error("Docker registry token response missing 'token' field");
-    }
-
-    return response["token"].get<std::string>();
-}
-
 static std::string common_docker_resolve_model(const std::string & docker) {
-    // Parse ai/smollm2:135M-Q4_0
-    size_t      colon_pos = docker.find(':');
-    std::string repo, tag;
-    if (colon_pos != std::string::npos) {
-        repo = docker.substr(0, colon_pos);
-        tag  = docker.substr(colon_pos + 1);
-    } else {
-        repo = docker;
-        tag  = "latest";
-    }
-
-    // ai/ is the default
-    size_t      slash_pos = docker.find('/');
+    // Parse image reference (e.g., ai/smollm2:135M-Q4_0)
+    std::string image_ref = docker;
+    
+    // ai/ is the default namespace for Docker Hub
+    size_t slash_pos = docker.find('/');
     if (slash_pos == std::string::npos) {
-        repo.insert(0, "ai/");
+        image_ref = "ai/" + docker;
     }
 
-    LOG_INF("%s: Downloading Docker Model: %s:%s\n", __func__, repo.c_str(), tag.c_str());
+    // Add registry prefix if not present
+    if (image_ref.find("registry-1.docker.io/") != 0 && 
+        image_ref.find("docker.io/") != 0 &&
+        image_ref.find("index.docker.io/") != 0) {
+        // For Docker Hub images without explicit registry
+        image_ref = "index.docker.io/" + image_ref;
+    }
+
+    LOG_INF("%s: Pulling OCI model: %s\n", __func__, image_ref.c_str());
+
     try {
-        // --- helper: digest validation ---
-        auto validate_oci_digest = [](const std::string & digest) -> std::string {
-            // Expected: algo:hex ; start with sha256 (64 hex chars)
-            // You can extend this map if supporting other algorithms in future.
-            static const std::regex re("^sha256:([a-fA-F0-9]{64})$");
-            std::smatch m;
-            if (!std::regex_match(digest, m, re)) {
-                throw std::runtime_error("Invalid OCI digest format received in manifest: " + digest);
-            }
-            // normalize hex to lowercase
-            std::string normalized = digest;
-            std::transform(normalized.begin()+7, normalized.end(), normalized.begin()+7, [](unsigned char c){
-                return std::tolower(c);
-            });
-            return normalized;
-        };
-
-        std::string token = common_docker_get_token(repo);  // Get authentication token
-
-        // Get manifest
-        const std::string    url_prefix = "https://registry-1.docker.io/v2/" + repo;
-        std::string          manifest_url = url_prefix + "/manifests/" + tag;
-        common_remote_params manifest_params;
-        manifest_params.headers.push_back("Authorization: Bearer " + token);
-        manifest_params.headers.push_back(
-            "Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json");
-        auto manifest_res = common_remote_get_content(manifest_url, manifest_params);
-        if (manifest_res.first != 200) {
-            throw std::runtime_error("Failed to get Docker manifest, HTTP code: " + std::to_string(manifest_res.first));
+        // Get cache directory
+        std::string cache_dir = fs_get_cache_directory();
+        
+        // Call the Go OCI library
+        auto result = oci_pull_model(image_ref, cache_dir);
+        
+        if (!result.success()) {
+            throw std::runtime_error("OCI pull failed: " + result.error_message);
         }
 
-        std::string            manifest_str(manifest_res.second.begin(), manifest_res.second.end());
-        nlohmann::ordered_json manifest = nlohmann::ordered_json::parse(manifest_str);
-        std::string            gguf_digest;  // Find the GGUF layer
-        if (manifest.contains("layers")) {
-            for (const auto & layer : manifest["layers"]) {
-                if (layer.contains("mediaType")) {
-                    std::string media_type = layer["mediaType"].get<std::string>();
-                    if (media_type == "application/vnd.docker.ai.gguf.v3" ||
-                        media_type.find("gguf") != std::string::npos) {
-                        gguf_digest = layer["digest"].get<std::string>();
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (gguf_digest.empty()) {
-            throw std::runtime_error("No GGUF layer found in Docker manifest");
-        }
-
-        // Validate & normalize digest
-        gguf_digest = validate_oci_digest(gguf_digest);
-        LOG_DBG("%s: Using validated digest: %s\n", __func__, gguf_digest.c_str());
-
-        // Prepare local filename
-        std::string model_filename = repo;
-        std::replace(model_filename.begin(), model_filename.end(), '/', '_');
-        model_filename += "_" + tag + ".gguf";
-        std::string local_path = fs_get_cache_file(model_filename);
-
-        const std::string blob_url = url_prefix + "/blobs/" + gguf_digest;
-        if (!common_download_file_single(blob_url, local_path, token, false)) {
-            throw std::runtime_error("Failed to download Docker Model");
-        }
-
-        LOG_INF("%s: Downloaded Docker Model to: %s\n", __func__, local_path.c_str());
-        return local_path;
+        LOG_INF("%s: Downloaded OCI model to: %s\n", __func__, result.local_path.c_str());
+        return result.local_path;
     } catch (const std::exception & e) {
-        LOG_ERR("%s: Docker Model download failed: %s\n", __func__, e.what());
+        LOG_ERR("%s: OCI model download failed: %s\n", __func__, e.what());
         throw;
     }
 }
