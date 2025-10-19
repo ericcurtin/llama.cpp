@@ -44,7 +44,7 @@ endif()
 
 set(TARGET common)
 
-add_library(${TARGET} STATIC
+set(COMMON_SOURCES
     arg.cpp
     arg.h
     base64.hpp
@@ -65,8 +65,6 @@ add_library(${TARGET} STATIC
     log.h
     ngram-cache.cpp
     ngram-cache.h
-    oci.cpp
-    oci.h
     regex-partial.cpp
     regex-partial.h
     sampling.cpp
@@ -74,6 +72,8 @@ add_library(${TARGET} STATIC
     speculative.cpp
     speculative.h
     )
+
+add_library(${TARGET} STATIC ${COMMON_SOURCES})
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -98,6 +98,8 @@ if (GO_EXECUTABLE)
     add_dependencies(${TARGET} oci_go_lib)
 
     target_include_directories(${TARGET} PRIVATE ${OCI_GO_DIR})
+    target_sources(${TARGET} PRIVATE oci.cpp oci.h)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_OCI)
     set(LLAMA_COMMON_EXTRA_LIBS build_info ${OCI_LIB})
  
     # On macOS, the Go runtime requires CoreFoundation and Security frameworks
