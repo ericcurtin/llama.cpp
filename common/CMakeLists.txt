@@ -85,18 +85,29 @@ if (GO_EXECUTABLE)
         COMMAND ${GO_EXECUTABLE} version
         OUTPUT_VARIABLE GO_VERSION_OUTPUT
         OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE GO_VERSION_RESULT
     )
     
-    # Extract version number from "go version go1.X.Y ..."
-    string(REGEX MATCH "go([0-9]+)\\.([0-9]+)" GO_VERSION_MATCH "${GO_VERSION_OUTPUT}")
-    set(GO_VERSION_MAJOR ${CMAKE_MATCH_1})
-    set(GO_VERSION_MINOR ${CMAKE_MATCH_2})
-    
-    if (GO_VERSION_MAJOR LESS 1 OR (GO_VERSION_MAJOR EQUAL 1 AND GO_VERSION_MINOR LESS 21))
-        message(WARNING "Go version ${GO_VERSION_MAJOR}.${GO_VERSION_MINOR} is too old. OCI functionality requires Go 1.21 or later. OCI functionality will not be available.")
-        set(GO_VERSION_OK FALSE)
+    if (GO_VERSION_RESULT EQUAL 0)
+        # Extract version number from "go version go1.X.Y ..." or "go version go1.X ..."
+        string(REGEX MATCH "go([0-9]+)\\.([0-9]+)" GO_VERSION_MATCH "${GO_VERSION_OUTPUT}")
+        if (GO_VERSION_MATCH)
+            set(GO_VERSION_MAJOR ${CMAKE_MATCH_1})
+            set(GO_VERSION_MINOR ${CMAKE_MATCH_2})
+            
+            if (GO_VERSION_MAJOR LESS 1 OR (GO_VERSION_MAJOR EQUAL 1 AND GO_VERSION_MINOR LESS 21))
+                message(WARNING "Go version ${GO_VERSION_MAJOR}.${GO_VERSION_MINOR} is too old. OCI functionality requires Go 1.21 or later. OCI functionality will not be available.")
+                set(GO_VERSION_OK FALSE)
+            else()
+                set(GO_VERSION_OK TRUE)
+            endif()
+        else()
+            message(WARNING "Unable to parse Go version from: ${GO_VERSION_OUTPUT}. OCI functionality will not be available.")
+            set(GO_VERSION_OK FALSE)
+        endif()
     else()
-        set(GO_VERSION_OK TRUE)
+        message(WARNING "Failed to get Go version. OCI functionality will not be available.")
+        set(GO_VERSION_OK FALSE)
     endif()
 endif()
 
