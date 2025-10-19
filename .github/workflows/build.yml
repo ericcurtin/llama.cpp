@@ -20,7 +20,10 @@ on:
       '**/*.swift',
       '**/*.m',
       '**/*.metal',
-      '**/*.comp'
+      '**/*.comp',
+      '**/*.go',
+      '**/go.mod',
+      '**/go.sum'
     ]
 
   pull_request:
@@ -40,7 +43,10 @@ on:
       '**/*.swift',
       '**/*.m',
       '**/*.metal',
-      '**/*.comp'
+      '**/*.comp',
+      '**/*.go',
+      '**/go.mod',
+      '**/go.sum'
     ]
 
 concurrency:
