@@ -102,9 +102,9 @@ if (GO_EXECUTABLE)
     
     # On macOS, the Go runtime requires CoreFoundation and Security frameworks
     if (APPLE)
-        find_library(CORE_FOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
-        find_library(SECURITY_FRAMEWORK Security REQUIRED)
-        set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ${CORE_FOUNDATION_FRAMEWORK} ${SECURITY_FRAMEWORK})
+        find_library(OCI_CORE_FOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+        find_library(OCI_SECURITY_FRAMEWORK Security REQUIRED)
+        set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ${OCI_CORE_FOUNDATION_FRAMEWORK} ${OCI_SECURITY_FRAMEWORK})
     endif()
 else()
     message(WARNING "Go compiler not found. OCI functionality will not be available.")
