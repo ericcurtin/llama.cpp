@@ -15,7 +15,10 @@ on:
       '**/*.cpp',
       '**/*.cu',
       '**/*.cuh',
-      '**/*.comp'
+      '**/*.comp',
+      '**/*.go',
+      '**/go.mod',
+      '**/go.sum'
     ]
 
 concurrency:
