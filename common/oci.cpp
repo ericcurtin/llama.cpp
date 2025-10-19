@@ -1,15 +1,13 @@
 #ifdef LLAMA_USE_OCI
 
-#include "oci.h"
+#    include "oci.h"
 
-#include "log.h"
+#    include "log.h"
 
-#include <nlohmann/json.hpp>
+#    include <nlohmann/json.hpp>
 
 // Include the Go-generated header
-extern "C" {
-#include "../oci-go/liboci.h"
-}
+#    include "../oci-go/liboci.h"
 
 using json = nlohmann::ordered_json;
 
