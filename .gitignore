@@ -22,6 +22,7 @@
 *.tmp
 
 # OCI Go generated files
+oci-go/liboci.a
 oci-go/liboci.h
 
 # IDE / OS

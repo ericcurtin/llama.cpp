@@ -80,6 +80,27 @@ endif()
 # Build OCI Go library
 find_program(GO_EXECUTABLE go)
 if (GO_EXECUTABLE)
+    # Check Go version - we need at least 1.21 for toolchain directive support
+    execute_process(
+        COMMAND ${GO_EXECUTABLE} version
+        OUTPUT_VARIABLE GO_VERSION_OUTPUT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    
+    # Extract version number from "go version go1.X.Y ..."
+    string(REGEX MATCH "go([0-9]+)\\.([0-9]+)" GO_VERSION_MATCH "${GO_VERSION_OUTPUT}")
+    set(GO_VERSION_MAJOR ${CMAKE_MATCH_1})
+    set(GO_VERSION_MINOR ${CMAKE_MATCH_2})
+    
+    if (GO_VERSION_MAJOR LESS 1 OR (GO_VERSION_MAJOR EQUAL 1 AND GO_VERSION_MINOR LESS 21))
+        message(WARNING "Go version ${GO_VERSION_MAJOR}.${GO_VERSION_MINOR} is too old. OCI functionality requires Go 1.21 or later. OCI functionality will not be available.")
+        set(GO_VERSION_OK FALSE)
+    else()
+        set(GO_VERSION_OK TRUE)
+    endif()
+endif()
+
+if (GO_EXECUTABLE AND GO_VERSION_OK)
     set(OCI_GO_DIR ${CMAKE_SOURCE_DIR}/oci-go)
     set(OCI_LIB ${OCI_GO_DIR}/liboci.a)
     set(OCI_HEADER ${OCI_GO_DIR}/liboci.h)
@@ -107,7 +128,9 @@ if (GO_EXECUTABLE)
         set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ${OCI_CORE_FOUNDATION_FRAMEWORK} ${OCI_SECURITY_FRAMEWORK})
     endif()
 else()
-    message(WARNING "Go compiler not found. OCI functionality will not be available.")
+    if (NOT GO_EXECUTABLE)
+        message(WARNING "Go compiler not found. OCI functionality will not be available.")
+    endif()
     set(LLAMA_COMMON_EXTRA_LIBS build_info)
 endif()
 
