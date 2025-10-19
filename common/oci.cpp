@@ -1,3 +1,5 @@
+#ifdef LLAMA_USE_OCI
+
 #include "oci.h"
 
 #include "log.h"
@@ -54,3 +56,5 @@ oci_pull_result oci_pull_model(const std::string & imageRef, const std::string &
 
     return result;
 }
+
+#endif // LLAMA_USE_OCI

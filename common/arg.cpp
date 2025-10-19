@@ -5,7 +5,9 @@
 #include "gguf.h" // for reading GGUF splits
 #include "json-schema-to-grammar.h"
 #include "log.h"
+#ifdef LLAMA_USE_OCI
 #include "oci.h"
+#endif
 #include "sampling.h"
 
 // fix problem with std::min and std::max
@@ -1044,6 +1046,7 @@ static struct common_hf_file_res common_get_hf_file(const std::string & hf_repo_
 // Docker registry functions
 //
 
+#ifdef LLAMA_USE_OCI
 static std::string common_docker_resolve_model(const std::string & docker) {
     // Parse image reference (e.g., ai/smollm2:135M-Q4_0)
     std::string image_ref = docker;
@@ -1078,6 +1081,7 @@ static std::string common_docker_resolve_model(const std::string & docker) {
         throw;
     }
 }
+#endif // LLAMA_USE_OCI
 
 //
 // utils
@@ -1129,9 +1133,12 @@ static handle_model_result common_params_handle_model(
     handle_model_result result;
     // handle pre-fill default model path and url based on hf_repo and hf_file
     {
+#ifdef LLAMA_USE_OCI
         if (!model.docker_repo.empty()) {  // Handle Docker URLs by resolving them to local paths
             model.path = common_docker_resolve_model(model.docker_repo);
-        } else if (!model.hf_repo.empty()) {
+        } else
+#endif
+        if (!model.hf_repo.empty()) {
             // short-hand to avoid specifying --hf-file -> default it to --model
             if (model.hf_file.empty()) {
                 if (model.path.empty()) {
