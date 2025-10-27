@@ -30,6 +30,7 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
+            llama-safetensors.cpp
             llama-sampling.cpp
             llama-vocab.cpp
             unicode-data.cpp

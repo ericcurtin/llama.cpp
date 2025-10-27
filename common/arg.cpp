@@ -227,6 +227,7 @@ std::string common_arg::to_string() {
 struct common_hf_file_res {
     std::string repo; // repo name with ":tag" removed
     std::string ggufFile;
+    std::string safetensorsFile;
     std::string mmprojFile;
 };
 
@@ -962,6 +963,51 @@ static struct common_hf_file_res common_get_hf_file(const std::string & hf_repo_
         throw std::invalid_argument("error: invalid HF repo format, expected <user>/<model>[:quant]\n");
     }
 
+    std::string safetensorsFile;
+    
+    // First, try to check for safetensors files directly from HuggingFace
+    if (!offline) {
+        // Check for model.safetensors first (single file format)
+        std::string safetensors_url = "https://huggingface.co/" + hf_repo + "/resolve/main/model.safetensors";
+        
+        common_remote_params params;
+        std::vector<std::string> headers;
+        headers.push_back("Accept: application/json");
+        if (!bearer_token.empty()) {
+            headers.push_back("Authorization: Bearer " + bearer_token);
+        }
+        params.headers = headers;
+        params.max_size = 1; // Just check if file exists, don't download
+        
+        // Try a minimal request to check if safetensors file exists
+        try {
+            auto res = common_remote_get_content(safetensors_url, params);
+            if (res.first == 200) {
+                LOG_INF("Found safetensors model: model.safetensors\n");
+                safetensorsFile = "model.safetensors";
+                return { hf_repo, "", safetensorsFile, "" };
+            }
+        } catch (...) {
+            // File doesn't exist, continue to check for sharded version
+        }
+        
+        // If single file doesn't exist, check for sharded safetensors (model.safetensors.index.json)
+        std::string index_url = "https://huggingface.co/" + hf_repo + "/resolve/main/model.safetensors.index.json";
+        try {
+            auto res = common_remote_get_content(index_url, params);
+            if (res.first == 200) {
+                LOG_INF("Found sharded safetensors model (index.json found)\n");
+                // For sharded models, we'll need to handle multiple files
+                // For now, indicate that safetensors is available but needs special handling
+                safetensorsFile = "model.safetensors.index.json";
+                return { hf_repo, "", safetensorsFile, "" };
+            }
+        } catch (...) {
+            // Neither single nor sharded safetensors found, fall back to GGUF
+        }
+    }
+
+    // If no safetensors found, fall back to existing GGUF logic
     std::string url = get_model_endpoint() + "v2/" + hf_repo + "/manifests/" + tag;
 
     // headers
@@ -1007,6 +1053,7 @@ static struct common_hf_file_res common_get_hf_file(const std::string & hf_repo_
     }
     std::string ggufFile;
     std::string mmprojFile;
+    // safetensorsFile is already declared in the function above
 
     if (res_code == 200 || res_code == 304) {
         try {
@@ -1036,7 +1083,7 @@ static struct common_hf_file_res common_get_hf_file(const std::string & hf_repo_
         throw std::runtime_error("error: model does not have ggufFile");
     }
 
-    return { hf_repo, ggufFile, mmprojFile };
+    return { hf_repo, ggufFile, safetensorsFile, mmprojFile };
 }
 
 //
@@ -1214,11 +1261,22 @@ static handle_model_result common_params_handle_model(
             if (model.hf_file.empty()) {
                 if (model.path.empty()) {
                     auto auto_detected = common_get_hf_file(model.hf_repo, bearer_token, offline);
-                    if (auto_detected.repo.empty() || auto_detected.ggufFile.empty()) {
+                    if (auto_detected.repo.empty()) {
                         exit(1); // built without CURL, error message already printed
                     }
+                    
+                    // Prefer safetensors over GGUF if available
+                    if (!auto_detected.safetensorsFile.empty()) {
+                        model.hf_file = auto_detected.safetensorsFile;
+                        LOG_INF("Using safetensors format: %s\n", model.hf_file.c_str());
+                    } else if (!auto_detected.ggufFile.empty()) {
+                        model.hf_file = auto_detected.ggufFile;
+                        LOG_INF("Using GGUF format: %s\n", model.hf_file.c_str());
+                    } else {
+                        exit(1); // No supported format found
+                    }
+                    
                     model.hf_repo = auto_detected.repo;
-                    model.hf_file = auto_detected.ggufFile;
                     if (!auto_detected.mmprojFile.empty()) {
                         result.found_mmproj   = true;
                         result.mmproj.hf_repo = model.hf_repo;

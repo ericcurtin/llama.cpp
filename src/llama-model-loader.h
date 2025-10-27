@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-arch.h"
 #include "llama-mmap.h"
+#include "llama-safetensors.h"
 
 #include "ggml-cpp.h"
 
@@ -19,6 +20,11 @@ enum llama_fver {
     GGUF_FILE_VERSION_V1 = 1,
     GGUF_FILE_VERSION_V2 = 2,
     GGUF_FILE_VERSION_V3 = 3,
+};
+
+enum llama_fformat {
+    LLAMA_FFORMAT_GGUF,
+    LLAMA_FFORMAT_SAFETENSORS,
 };
 
 const char * llama_file_version_name(llama_fver version);
@@ -75,6 +81,7 @@ struct llama_model_loader {
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
+    llama_fformat fformat;
 
     llama_mmaps mappings;
 
@@ -84,6 +91,9 @@ struct llama_model_loader {
 
     gguf_context_ptr meta;
     std::vector<ggml_context_ptr> contexts;
+    
+    // For safetensors support
+    std::unique_ptr<llama_safetensors_file> safetensors_file;
 
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
@@ -167,4 +177,8 @@ struct llama_model_loader {
     std::string ftype_name() const;
 
     void print_info() const;
+
+private:
+    void load_gguf_model(const std::string & fname, std::vector<std::string> & splits);
+    void load_safetensors_model(const std::string & fname);
 };
