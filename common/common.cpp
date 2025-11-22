@@ -1691,7 +1691,14 @@ int common_get_pooling_type_from_file(const std::string & path) {
             std::string key = std::string(arch) + ".pooling_type";
             int64_t pooling_idx = gguf_find_key(ctx, key.c_str());
             if (pooling_idx >= 0) {
-                pooling_type = gguf_get_val_u32(ctx, pooling_idx);
+                // Check the type before reading to avoid assertion failures
+                enum gguf_type type = gguf_get_kv_type(ctx, pooling_idx);
+                if (type == GGUF_TYPE_UINT32) {
+                    pooling_type = gguf_get_val_u32(ctx, pooling_idx);
+                } else if (type == GGUF_TYPE_INT32) {
+                    pooling_type = gguf_get_val_i32(ctx, pooling_idx);
+                }
+                // If type is not UINT32 or INT32, we'll return -1 (pooling_type stays -1)
             }
         }
     }
