@@ -27,9 +27,6 @@ RUN cd /tmp && \
     make install && \
     cd / && rm -rf /tmp/shaderc
 
-# Make glslc available in PATH
-ENV PATH="/usr/local/bin:${PATH}"
-
 # Build it
 WORKDIR /app
 
