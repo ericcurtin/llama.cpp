@@ -5,11 +5,30 @@ FROM ubuntu:$UBUNTU_VERSION AS build
 # Ref: https://vulkan.lunarg.com/doc/sdk/latest/linux/getting_started.html
 
 # Install build tools
-RUN apt update && apt install -y git build-essential cmake wget xz-utils
+RUN apt update && apt install -y git build-essential cmake wget xz-utils python3
 
-# Install cURL and Vulkan SDK dependencies
+# Install cURL and Vulkan SDK dependencies (excluding glslc, which we'll build from source)
 RUN apt install -y libcurl4-openssl-dev curl \
-    libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev glslc
+    libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev
+
+# Build shaderc (glslc) from source with latest glslang and SPIRV-Tools
+# This ensures support for GL_EXT_integer_dot_product extension
+RUN cd /tmp && \
+    git clone https://github.com/google/shaderc.git && \
+    cd shaderc && \
+    python3 ./utils/git-sync-deps && \
+    mkdir build && cd build && \
+    cmake -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/usr/local \
+          -DSHADERC_SKIP_TESTS=ON \
+          -DSHADERC_SKIP_EXAMPLES=ON \
+          .. && \
+    make -j$(nproc) && \
+    make install && \
+    cd / && rm -rf /tmp/shaderc
+
+# Make glslc available in PATH
+ENV PATH="/usr/local/bin:${PATH}"
 
 # Build it
 WORKDIR /app
