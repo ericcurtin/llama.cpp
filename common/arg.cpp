@@ -438,6 +438,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
         // Auto-detect embeddings and reranking based on model repository name
         // Check hf_repo first, then docker_repo, then the model path as fallback
+        // Only auto-detect if the user hasn't explicitly set --embedding or --reranking
         std::string model_identifier;
         if (!params.model.hf_repo.empty()) {
             model_identifier = params.model.hf_repo;
@@ -447,19 +448,19 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             model_identifier = params.model.path;
         }
 
-        // Only auto-detect if not already explicitly set by user
-        // Check if params.embedding or params.pooling_type were set by command line args
         // We detect reranking first since it's more specific than embedding
         if (!model_identifier.empty()) {
             if (is_reranking_model(model_identifier)) {
                 // Reranking models need both embedding enabled and RANK pooling type
-                if (!params.embedding) {
+                // Only auto-detect if user hasn't set --embedding or --pooling explicitly
+                if (!params.embedding && params.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
                     LOG_INF("%s: auto-detected reranking model, enabling --reranking\n", __func__);
                     params.embedding    = true;
                     params.pooling_type = LLAMA_POOLING_TYPE_RANK;
                 }
             } else if (is_embedding_model(model_identifier)) {
                 // Regular embedding models just need embedding enabled
+                // Only auto-detect if user hasn't set --embedding explicitly
                 if (!params.embedding) {
                     LOG_INF("%s: auto-detected embedding model, enabling --embeddings\n", __func__);
                     params.embedding = true;
