@@ -14,7 +14,7 @@ RUN apt install -y libcurl4-openssl-dev curl \
 # Build shaderc (glslc) from source with latest glslang and SPIRV-Tools
 # This ensures support for GL_EXT_integer_dot_product extension
 RUN cd /tmp && \
-    git clone https://github.com/google/shaderc.git && \
+    git clone --depth 1 https://github.com/google/shaderc.git && \
     cd shaderc && \
     python3 ./utils/git-sync-deps && \
     mkdir build && cd build && \
