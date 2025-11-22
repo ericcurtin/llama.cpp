@@ -423,6 +423,34 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         common_params_handle_model(params.vocoder.model,     params.hf_token, "", params.offline);
     }
 
+    // Auto-detect embeddings/reranking based on model metadata if not explicitly set
+    // Only auto-detect if --embeddings or --reranking flags were not explicitly provided
+    // and if the model was specified via -hf/-hfr/--hf-repo or -dr/--docker-repo
+    if (!params.model.hf_repo.empty() || !params.model.docker_repo.empty()) {
+        // Only auto-detect if user hasn't explicitly set embedding or pooling_type
+        bool user_set_embedding = params.embedding;
+        bool user_set_pooling = (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED);
+        
+        if (!user_set_embedding && !user_set_pooling && !params.model.path.empty()) {
+            int detected_pooling = common_get_pooling_type_from_file(params.model.path);
+            if (detected_pooling >= 0) {
+                if (detected_pooling == LLAMA_POOLING_TYPE_RANK) {
+                    // Reranking model detected
+                    LOG_INF("Auto-detected reranking model (pooling_type=%d), enabling --reranking\n", detected_pooling);
+                    params.embedding = true;
+                    params.pooling_type = LLAMA_POOLING_TYPE_RANK;
+                } else if (detected_pooling == LLAMA_POOLING_TYPE_MEAN || 
+                           detected_pooling == LLAMA_POOLING_TYPE_CLS || 
+                           detected_pooling == LLAMA_POOLING_TYPE_LAST) {
+                    // Embedding model detected
+                    LOG_INF("Auto-detected embedding model (pooling_type=%d), enabling --embeddings\n", detected_pooling);
+                    params.embedding = true;
+                    // Note: we don't override pooling_type here, let model defaults apply
+                }
+            }
+        }
+    }
+
     if (params.escape) {
         string_process_escapes(params.prompt);
         string_process_escapes(params.input_prefix);

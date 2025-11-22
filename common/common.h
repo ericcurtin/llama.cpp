@@ -527,6 +527,10 @@ void common_init();
 
 std::string common_params_get_system_info(const common_params & params);
 
+// Detect model pooling type from GGUF metadata
+// Returns -1 if unable to detect, otherwise returns the pooling type value
+int common_get_pooling_type_from_file(const std::string & path);
+
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);
 void postprocess_cpu_params(cpu_params & cpuparams, const cpu_params * role_model = nullptr);
