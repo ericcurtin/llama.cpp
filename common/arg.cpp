@@ -209,6 +209,20 @@ struct handle_model_result {
     common_params_model mmproj;
 };
 
+// Helper function to check if a string contains embedding-related keywords (case-insensitive)
+static bool is_embedding_model(const std::string & str) {
+    std::string lower = str;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    return lower.find("embed") != std::string::npos;
+}
+
+// Helper function to check if a string contains reranking-related keywords (case-insensitive)
+static bool is_reranking_model(const std::string & str) {
+    std::string lower = str;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    return lower.find("rerank") != std::string::npos;
+}
+
 static handle_model_result common_params_handle_model(
         struct common_params_model & model,
         const std::string & bearer_token,
@@ -421,6 +435,37 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
         common_params_handle_model(params.speculative.model, params.hf_token, "", params.offline);
         common_params_handle_model(params.vocoder.model,     params.hf_token, "", params.offline);
+
+        // Auto-detect embeddings and reranking based on model repository name
+        // Check hf_repo first, then docker_repo, then the model path as fallback
+        std::string model_identifier;
+        if (!params.model.hf_repo.empty()) {
+            model_identifier = params.model.hf_repo;
+        } else if (!params.model.docker_repo.empty()) {
+            model_identifier = params.model.docker_repo;
+        } else {
+            model_identifier = params.model.path;
+        }
+
+        // Only auto-detect if not already explicitly set by user
+        // Check if params.embedding or params.pooling_type were set by command line args
+        // We detect reranking first since it's more specific than embedding
+        if (!model_identifier.empty()) {
+            if (is_reranking_model(model_identifier)) {
+                // Reranking models need both embedding enabled and RANK pooling type
+                if (!params.embedding) {
+                    LOG_INF("%s: auto-detected reranking model, enabling --reranking\n", __func__);
+                    params.embedding    = true;
+                    params.pooling_type = LLAMA_POOLING_TYPE_RANK;
+                }
+            } else if (is_embedding_model(model_identifier)) {
+                // Regular embedding models just need embedding enabled
+                if (!params.embedding) {
+                    LOG_INF("%s: auto-detected embedding model, enabling --embeddings\n", __func__);
+                    params.embedding = true;
+                }
+            }
+        }
     }
 
     if (params.escape) {
