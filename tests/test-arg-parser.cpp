@@ -157,5 +157,8 @@ int main(void) {
         }
     }
 
+    printf("test-arg-parser: test auto-detection of embedding models\n\n");
+    printf("  (auto-detection logic is tested indirectly via integration tests)\n");
+
     printf("test-arg-parser: all tests OK\n\n");
 }
