@@ -1719,3 +1719,45 @@ float lr_opt::get_lr(float epoch) const {
     LOG_INF("epoch %.2g lr=%.2g\n", epoch, r);
     return r;
 }
+
+int common_get_pooling_type_from_file(const std::string & path) {
+    // Try to read pooling_type from GGUF file metadata without loading full model
+    if (path.empty() || !std::filesystem::exists(path)) {
+        return -1;
+    }
+
+    struct gguf_init_params params = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ nullptr,
+    };
+
+    struct gguf_context * ctx = gguf_init_from_file(path.c_str(), params);
+    if (!ctx) {
+        return -1;
+    }
+
+    int pooling_type = -1;
+
+    // Try to read general.architecture first to construct the proper key
+    int64_t arch_idx = gguf_find_key(ctx, "general.architecture");
+    if (arch_idx >= 0) {
+        const char * arch = gguf_get_val_str(ctx, arch_idx);
+        if (arch) {
+            std::string key = std::string(arch) + ".pooling_type";
+            int64_t pooling_idx = gguf_find_key(ctx, key.c_str());
+            if (pooling_idx >= 0) {
+                // Check the type before reading to avoid assertion failures
+                enum gguf_type type = gguf_get_kv_type(ctx, pooling_idx);
+                if (type == GGUF_TYPE_UINT32) {
+                    pooling_type = gguf_get_val_u32(ctx, pooling_idx);
+                } else if (type == GGUF_TYPE_INT32) {
+                    pooling_type = gguf_get_val_i32(ctx, pooling_idx);
+                }
+                // If type is not UINT32 or INT32, we'll return -1 (pooling_type stays -1)
+            }
+        }
+    }
+
+    gguf_free(ctx);
+    return pooling_type;
+}

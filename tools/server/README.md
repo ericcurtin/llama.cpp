@@ -9,6 +9,7 @@ Set of LLM REST APIs and a simple web front end to interact with llama.cpp.
  * [OpenAI API](https://github.com/openai/openai-openapi) compatible chat completions and embeddings routes
  * [Anthropic Messages API](https://docs.anthropic.com/en/api/messages) compatible chat completions
  * Reranking endpoint (https://github.com/ggml-org/llama.cpp/pull/9510)
+ * **Automatic detection of embedding and reranking models** when using `-hf` or `-dr` flags
  * Parallel decoding with multi-user support
  * Continuous batching
  * Multimodal ([documentation](../../docs/multimodal.md)) / with OpenAI-compatible API support
@@ -181,8 +182,8 @@ The project is under active development, and we are [looking for feedback and co
 | `--path PATH` | path to serve static files from (default: )<br/>(env: LLAMA_ARG_STATIC_PATH) |
 | `--api-prefix PREFIX` | prefix path the server serves from, without the trailing slash (default: )<br/>(env: LLAMA_ARG_API_PREFIX) |
 | `--no-webui` | Disable the Web UI (default: enabled)<br/>(env: LLAMA_ARG_NO_WEBUI) |
-| `--embedding, --embeddings` | restrict to only support embedding use case; use only with dedicated embedding models (default: disabled)<br/>(env: LLAMA_ARG_EMBEDDINGS) |
-| `--reranking, --rerank` | enable reranking endpoint on server (default: disabled)<br/>(env: LLAMA_ARG_RERANKING) |
+| `--embedding, --embeddings` | restrict to only support embedding use case; use only with dedicated embedding models (default: disabled, auto-detected when using `-hf` or `-dr` with embedding models)<br/>(env: LLAMA_ARG_EMBEDDINGS) |
+| `--reranking, --rerank` | enable reranking endpoint on server (default: disabled, auto-detected when using `-hf` or `-dr` with reranking models)<br/>(env: LLAMA_ARG_RERANKING) |
 | `--api-key KEY` | API key to use for authentication (default: none)<br/>(env: LLAMA_API_KEY) |
 | `--api-key-file FNAME` | path to file containing API keys (default: none) |
 | `--ssl-key-file FNAME` | path to file a PEM-encoded SSL private key<br/>(env: LLAMA_ARG_SSL_KEY_FILE) |
