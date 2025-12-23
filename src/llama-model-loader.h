@@ -21,6 +21,11 @@ enum llama_fver {
     GGUF_FILE_VERSION_V3 = 3,
 };
 
+enum llama_file_type {
+    LLAMA_FILE_TYPE_GGUF = 0,
+    LLAMA_FILE_TYPE_SAFETENSORS = 1,
+};
+
 const char * llama_file_version_name(llama_fver version);
 
 struct llama_model_loader {
@@ -42,6 +47,9 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+
+        // Alternative constructor for safetensors
+        llama_tensor_weight(uint16_t idx, size_t offs, ggml_tensor * tensor) : idx(idx), offs(offs), tensor(tensor) {}
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -75,6 +83,7 @@ struct llama_model_loader {
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
+    llama_file_type file_type;
 
     llama_mmaps mappings;
 
@@ -167,4 +176,21 @@ struct llama_model_loader {
     std::string ftype_name() const;
 
     void print_info() const;
+
+public:
+    // For testing purposes, make these methods public
+    llama_file_type detect_file_type(const std::string & fname);
+    ggml_type safetensors_dtype_to_ggml_type(const std::string & dtype);
+    
+private:
+    // Safetensors support
+    struct safetensors_tensor_info {
+        std::string dtype;
+        std::vector<int64_t> shape;
+        std::pair<size_t, size_t> data_offsets;
+    };
+    
+    std::unordered_map<std::string, safetensors_tensor_info> safetensors_tensors;
+    
+    void load_safetensors_file(const std::string & fname);
 };
