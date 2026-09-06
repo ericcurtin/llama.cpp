@@ -191,6 +191,10 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--video-ffmpeg-dir DIR` | path to the directory containing ffmpeg and ffprobe (default: search in PATH)<br/>(env: LLAMA_ARG_VIDEO_FFMPEG_DIR) |
 | `-a, --alias STRING` | set model name aliases, comma-separated (to be used by API)<br/>(env: LLAMA_ARG_ALIAS) |
 | `--tags STRING` | set model tags, comma-separated (informational, not used for routing)<br/>(env: LLAMA_ARG_TAGS) |
+| `--text-encoder FILE` | text encoder GGUF for image generation models (Qwen2.5-VL for qwen_image, Qwen3 for lumina2)<br/>note: downloaded automatically when omitted<br/>(env: LLAMA_ARG_TEXT_ENCODER) |
+| `--text-encoder-hf <user>/<model>[:quant]` | Hugging Face repository of the text encoder for image generation models<br/>(env: LLAMA_ARG_TEXT_ENCODER_HF) |
+| `--vae FILE` | VAE decoder (safetensors or GGUF) for image generation models<br/>note: downloaded automatically when omitted<br/>(env: LLAMA_ARG_VAE) |
+| `--vae-hf <user>/<model>[:file]` | Hugging Face repository of the VAE for image generation models<br/>(env: LLAMA_ARG_VAE_HF) |
 | `--embd-normalize N` | normalisation for embeddings (default: 2) (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm) |
 | `--host HOST` | ip address to listen, or bind to an UNIX socket if the address ends with .sock (default: 127.0.0.1)<br/>(env: LLAMA_ARG_HOST) |
 | `--port PORT` | port to listen (default: 8080)<br/>(env: LLAMA_ARG_PORT) |
@@ -1566,6 +1570,29 @@ Example response:
   "object": "response.input_tokens",
   "input_tokens": 11
 }
+```
+
+### POST `/v1/images/generations`: OpenAI-compatible Images API
+
+Available when the server is started with a text-to-image model, for example `llama-server -hf unsloth/Z-Image-Turbo-GGUF` or `-hf unsloth/Qwen-Image-2512-GGUF`. The text encoder and VAE are downloaded automatically, or can be given with `--text-encoder` and `--vae`. See [tools/imgen](../imgen/README.md). `/props` reports `modalities.image_generation: true` for such a model.
+
+*Options:*
+
+`prompt`: The text to generate an image for.
+
+`size`: `WIDTHxHEIGHT`, multiples of 16 (default: `1024x1024`). `width` and `height` can be given instead.
+
+`n`: Number of images (default: `1`, at most 4). With a `seed`, image `i` uses `seed + i`.
+
+`response_format`: Only `b64_json` is supported.
+
+`steps`, `guidance_scale`, `negative_prompt`, `seed`: Sampling controls. Defaults depend on the model (8 steps without guidance for Z-Image-Turbo, 50 steps with `guidance_scale` 4 for Qwen-Image).
+
+*Example:*
+
+```sh
+curl http://localhost:8080/v1/images/generations -d '{"prompt": "a cat wearing a top hat", "size": "1024x1024"}' \
+  | jq -r '.data[0].b64_json' | base64 -d > cat.png
 ```
 
 ## Anthropic-compatible API Endpoints
