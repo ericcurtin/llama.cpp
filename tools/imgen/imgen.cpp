@@ -45,6 +45,26 @@ imgen_runner::imgen_runner(const imgen_params & params, int max_nodes) : max_nod
 
     sched.reset(ggml_backend_sched_new(backends.data(), bufts.data(), backends.size(), max_nodes, false, true));
 
+    if (getenv("IMGEN_DEBUG_TRACE")) {
+        // per node statistics, to diff runs across backends
+        ggml_backend_sched_set_eval_callback(sched.get(), [](ggml_tensor * t, bool ask, void *) {
+            if (ask) {
+                return true;
+            }
+            if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->view_src || !t->buffer) {
+                return true;
+            }
+            std::vector<float> vals(ggml_nelements(t));
+            ggml_backend_tensor_get(t, vals.data(), 0, ggml_nbytes(t));
+            double sum = 0, sum2 = 0;
+            for (float v : vals) {
+                sum += v; sum2 += (double) v * v;
+            }
+            IMGEN_LOG("trace %-14s %-40s [%6lld %6lld %4lld] mean=% .5f rms=%.5f\n", ggml_op_desc(t), t->name,
+                      (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], sum / vals.size(), std::sqrt(sum2 / vals.size()));
+            return true;
+        }, nullptr);
+    }
     if (getenv("IMGEN_DEBUG_NAN")) {
         // report the first node that produces a non-finite value
         ggml_backend_sched_set_eval_callback(sched.get(), [](ggml_tensor * t, bool ask, void *) {
@@ -296,6 +316,14 @@ static void debug_stats(const imgen_context & ctx, const char * name, const std:
     if (!ctx.params.verbose) {
         return;
     }
+    if (const char * dir = getenv("IMGEN_DEBUG_DUMP")) {
+        static int n_dump = 0;
+        FILE * f = fopen((std::string(dir) + "/" + std::to_string(n_dump++) + "_" + name + ".bin").c_str(), "wb");
+        if (f) {
+            fwrite(v.data(), sizeof(float), v.size(), f);
+            fclose(f);
+        }
+    }
     double sum = 0, sum2 = 0;
     float vmin = INFINITY, vmax = -INFINITY;
     size_t n_nan = 0;
@@ -385,13 +413,20 @@ bool imgen_generate(imgen_context * ctx, const imgen_request * req, imgen_image 
         IMGEN_LOG("%s: encoded prompt: %d tokens (%lld ms)\n", __func__, cond.n_tokens, (long long) (ggml_time_ms() - t0));
         debug_stats(*ctx, "cond", cond.embd);
 
+        // Box-Muller on mt19937_64 so a seed gives the same noise on every platform
         std::mt19937_64 rng(req->seed >= 0 ? (uint64_t) req->seed : std::random_device{}());
-        std::normal_distribution<float> normal(0.0f, 1.0f);
+        auto uniform = [&]() { return ((rng() >> 11) + 0.5) * (1.0 / 9007199254740992.0); };
         const size_t n_lat = (size_t) n_img * ctx->hp.in_ch * 4;
         std::vector<float> x(n_lat);
-        for (auto & v : x) {
-            v = normal(rng);
+        for (size_t i = 0; i < n_lat; i += 2) {
+            const double r = std::sqrt(-2.0 * std::log(uniform()));
+            const double a = 2.0 * M_PI * uniform();
+            x[i] = (float) (r * std::cos(a));
+            if (i + 1 < n_lat) {
+                x[i + 1] = (float) (r * std::sin(a));
+            }
         }
+        debug_stats(*ctx, "noise", x);
 
         const std::vector<float> sigmas = make_sigmas(*ctx, steps, n_img);
         std::vector<float> v_pos, v_neg;

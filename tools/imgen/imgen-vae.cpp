@@ -49,8 +49,11 @@ struct vae_graph {
         for (int64_t off = 0; off < n; off += chunk) {
             const int64_t len = std::min(chunk, n - off);
             ggml_tensor * qc = ggml_view_2d(g, qt, C, len, qt->nb[1], off * qt->nb[1]);
-            ggml_tensor * kq = ggml_soft_max_ext(g, ggml_mul_mat(g, kt, qc), nullptr, scale, 0.0f); // [n, len]
-            ggml_tensor * oc = ggml_mul_mat(g, vv, kq);                                              // [C, len]
+            ggml_tensor * kq = ggml_mul_mat(g, kt, qc); // [n, len], raw scores reach 1e8
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+            kq = ggml_soft_max_ext(g, kq, nullptr, scale, 0.0f);
+            ggml_tensor * oc = ggml_mul_mat(g, vv, kq); // [C, len]
+            ggml_mul_mat_set_prec(oc, GGML_PREC_F32);
             out = out ? ggml_concat(g, out, oc, 1) : oc;
         }
         out = ggml_cont(g, ggml_transpose(g, out)); // [n, C]

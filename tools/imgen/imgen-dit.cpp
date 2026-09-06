@@ -41,6 +41,8 @@ struct dit_graph {
         }
         ggml_tensor * y = ggml_mul_mat(g, w(name + ".weight"), x);
         ggml_set_name(y, name.c_str());
+        // outputs reach 1e5, F16 accumulation would saturate
+        ggml_mul_mat_set_prec(y, GGML_PREC_F32);
         if (scale != 1.0f) {
             y = ggml_scale(g, y, scale);
         }
@@ -93,9 +95,11 @@ struct dit_graph {
             q = ggml_permute(g, q, 0, 2, 1, 3); // [hd, L, nh]
             k = ggml_permute(g, k, 0, 2, 1, 3);
             ggml_tensor * kq = ggml_mul_mat(g, k, q); // [Lk, Lq, nh]
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
             kq = ggml_soft_max_ext(g, kq, nullptr, scale, 0.0f);
             ggml_tensor * vt = ggml_cont(g, ggml_permute(g, v, 1, 2, 0, 3)); // [L, hd, nkv]
             out = ggml_mul_mat(g, vt, kq); // [hd, Lq, nh]
+            ggml_mul_mat_set_prec(out, GGML_PREC_F32);
             out = ggml_cont(g, ggml_permute(g, out, 0, 2, 1, 3)); // [hd, nh, L]
         }
         return ggml_reshape_2d(g, out, hd * nh, L);
@@ -132,7 +136,7 @@ void rope_tables(const imgen_dit_hparams & hp, const std::vector<std::array<int,
 struct qwen_image_graph : dit_graph {
     using dit_graph::dit_graph;
 
-    ggml_tensor * build(const imgen_cond & cond, int hp_, int wp, float t_scaled, const std::vector<float> & x_in,
+    ggml_tensor * build(const imgen_cond & cond, int hp_, int wp, const float & t_scaled, const std::vector<float> & x_in,
                         const std::vector<float> & cos_t, const std::vector<float> & sin_t) {
         const int n_img = hp_ * wp;
         const int n_txt = cond.n_tokens;
@@ -277,7 +281,7 @@ struct lumina2_graph : dit_graph {
         return ggml_view_4d(g, t, t->ne[0], t->ne[1], t->ne[2], n, t->nb[1], t->nb[2], t->nb[3], (size_t) off * t->nb[3]);
     }
 
-    ggml_tensor * build(const imgen_cond & cond, int hp_, int wp, float t_scaled, const std::vector<float> & x_in,
+    ggml_tensor * build(const imgen_cond & cond, int hp_, int wp, const float & t_scaled, const std::vector<float> & x_in,
                         const std::vector<float> & cos_t, const std::vector<float> & sin_t) {
         const int n_img     = hp_ * wp;
         const int n_img_pad = (n_img + SEQ_MULTI_OF - 1) / SEQ_MULTI_OF * SEQ_MULTI_OF;
