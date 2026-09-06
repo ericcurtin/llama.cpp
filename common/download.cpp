@@ -803,6 +803,53 @@ common_download_hf_plan common_download_get_hf_plan(const common_params_model & 
     return plan;
 }
 
+common_download_hf_plan common_download_get_hf_vae_plan(const common_params_model & model, const common_download_opts & opts) {
+    common_download_hf_plan plan;
+    hf_cache::hf_files all;
+
+    auto [repo, file] = common_download_split_repo_tag(model.hf_repo);
+    if (!model.hf_file.empty()) {
+        file = model.hf_file;
+    }
+
+    if (!opts.offline) {
+        all = hf_cache::get_repo_files(repo, opts.bearer_token);
+    }
+    if (all.empty()) {
+        all = hf_cache::get_cached_files(repo);
+    }
+
+    for (const auto & f : all) {
+        if (!file.empty()) {
+            if (f.path == file) {
+                plan.primary = f;
+                break;
+            }
+            continue;
+        }
+        if (!string_ends_with(f.path, ".safetensors") && !string_ends_with(f.path, ".gguf")) {
+            continue;
+        }
+        std::string name = f.path;
+        if (auto pos = name.rfind('/'); pos != std::string::npos) {
+            name = name.substr(pos + 1);
+        }
+        std::string lower = f.path;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.find("vae") != std::string::npos || string_starts_with(name, "ae.")) {
+            plan.primary = f;
+            break;
+        }
+    }
+
+    if (plan.primary.path.empty()) {
+        LOG_ERR("%s: no VAE file found in repository %s\n", __func__, repo.c_str());
+    } else {
+        plan.model_files = { plan.primary };
+    }
+    return plan;
+}
+
 void common_download_run_tasks(const std::vector<common_download_task> & tasks) {
     std::vector<std::future<int>> futures;
     for (const auto & task : tasks) {

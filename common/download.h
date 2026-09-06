@@ -119,3 +119,7 @@ struct common_download_hf_plan {
     hf_cache::hf_file preset; // if set, only this file is downloaded
 };
 common_download_hf_plan common_download_get_hf_plan(const common_params_model & model, const common_download_opts & opts);
+
+// plan for a VAE repo: model.hf_repo is "<user>/<model>[:file]", without a file the first
+// safetensors/GGUF whose path contains "vae" (or is named ae.*) is used
+common_download_hf_plan common_download_get_hf_vae_plan(const common_params_model & model, const common_download_opts & opts);

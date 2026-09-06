@@ -16,6 +16,8 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "imgen.h"
+#include "base64.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -844,6 +846,10 @@ public:
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
 
+    // image generation: the main model is the text encoder, the DiT and VAE live in ictx
+    imgen_context * ictx = nullptr;
+    std::mutex      mutex_imgen;
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -949,6 +955,9 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+
+        imgen_free(ictx);
+        ictx = nullptr;
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1042,6 +1051,20 @@ private:
         SRV_INF("loading model '%s'\n", params.model.get_name().c_str());
         SRV_TRC("local path '%s'\n", params.model.path.c_str());
 
+        std::string imgen_dit_path;
+        if (imgen_is_dit_gguf(params_base.model.path.c_str())) {
+            if (params_base.imgen.text_encoder.path.empty() || params_base.imgen.vae.path.empty()) {
+                SRV_ERR("%s", "image generation model requires --text-encoder and --vae\n");
+                return false;
+            }
+            imgen_dit_path = params_base.model.path;
+            params_base.model.path = params_base.imgen.text_encoder.path;
+            // the text encoder only runs short prompts
+            params_base.n_ctx      = std::min(params_base.n_ctx > 0 ? params_base.n_ctx : 4096, 4096);
+            params_base.n_parallel = 1;
+            SRV_INF("image generation model, text encoder '%s'\n", params_base.model.path.c_str());
+        }
+
         std::string & mmproj_path = params_base.mmproj.path;
         mtmd_context_params mparams = mtmd_context_params_default();
         if (has_mmproj) {
@@ -1114,6 +1137,19 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        if (!imgen_dit_path.empty()) {
+            imgen_params iparams = imgen_params_default();
+            iparams.n_threads  = params_base.cpuparams.n_threads;
+            iparams.use_gpu    = params_base.n_gpu_layers != 0;
+            iparams.flash_attn = params_base.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            ictx = imgen_init(imgen_dit_path.c_str(), params_base.imgen.vae.path.c_str(), model_tgt, iparams);
+            if (!ictx) {
+                SRV_ERR("failed to load image generation model, '%s'\n", imgen_dit_path.c_str());
+                return false;
+            }
+            SRV_INF("loaded image generation model, '%s'\n", imgen_dit_path.c_str());
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -4180,6 +4216,7 @@ server_context_meta server_context::get_meta() const {
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
         /* has_inp_video          */ impl->chat_params.allow_video,
+        /* has_imgen              */ impl->ictx != nullptr,
         /* json_ui_settings       */ impl->json_ui_settings,
         /* slot_n_ctx             */ impl->n_ctx_slot(),
         /* pooling_type           */ llama_pooling_type(impl->ctx_tgt),
@@ -4603,6 +4640,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
             {"vision", meta.has_inp_image},
             {"video",  meta.has_inp_video},
             {"audio",  meta.has_inp_audio},
+            {"image_generation", meta.has_imgen},
         } },
         { "media_marker",                get_media_marker() },
         { "endpoint_slots",              params.endpoint_slots },
@@ -5038,6 +5076,82 @@ void server_routes::init_routes() {
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
         return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, ctx_server.init_opt, req, TASK_RESPONSE_TYPE_ANTHROPIC);
+    };
+
+    // OpenAI images API, generation runs synchronously on the imgen context
+    this->post_images_generations = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!meta->has_imgen) {
+            res->error(format_error_response("The current model does not support image generation.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        json body = json::parse(req.body);
+        const std::string prompt = json_value(body, "prompt", std::string());
+        if (prompt.empty()) {
+            res->error(format_error_response("\"prompt\" must be provided", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string response_format = json_value(body, "response_format", std::string("b64_json"));
+        if (response_format != "b64_json") {
+            res->error(format_error_response("Only response_format \"b64_json\" is supported", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const int n = json_value(body, "n", 1);
+        if (n < 1 || n > 4) {
+            res->error(format_error_response("\"n\" must be between 1 and 4", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        imgen_request ireq;
+        ireq.width  = json_value(body, "width",  0);
+        ireq.height = json_value(body, "height", 0);
+        const std::string size = json_value(body, "size", std::string());
+        if (!size.empty() && sscanf(size.c_str(), "%dx%d", &ireq.width, &ireq.height) != 2) {
+            res->error(format_error_response("\"size\" must be WIDTHxHEIGHT", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (ireq.width > 4096 || ireq.height > 4096) {
+            res->error(format_error_response("image size must be at most 4096x4096", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string negative_prompt = json_value(body, "negative_prompt", std::string());
+        ireq.prompt          = prompt.c_str();
+        ireq.negative_prompt = negative_prompt.c_str();
+        ireq.steps           = json_value(body, "steps", 0);
+        ireq.cfg_scale       = json_value(body, "guidance_scale", -1.0f);
+        ireq.seed            = json_value(body, "seed", (int64_t) -1);
+
+        json data = json::array();
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.mutex_imgen);
+            for (int i = 0; i < n; i++) {
+                imgen_image img;
+                if (!imgen_generate(ctx_server.ictx, &ireq, &img, nullptr, nullptr)) {
+                    res->error(format_error_response("image generation failed", ERROR_TYPE_SERVER));
+                    return res;
+                }
+                size_t n_png = 0;
+                uint8_t * png = imgen_image_to_png(&img, &n_png);
+                imgen_image_free(&img);
+                if (!png) {
+                    res->error(format_error_response("failed to encode image", ERROR_TYPE_SERVER));
+                    return res;
+                }
+                data.push_back({{ "b64_json", base64::encode((const char *) png, n_png) }});
+                free(png);
+                if (ireq.seed >= 0) {
+                    ireq.seed++;
+                }
+            }
+        }
+
+        res->ok({
+            { "created", std::time(nullptr) },
+            { "data",    data },
+        });
+        return res;
     };
 
     // same with handle_chat_completions, but without inference part

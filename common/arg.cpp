@@ -4,6 +4,7 @@
 #include "chat.h"
 #include "common.h"
 #include "download.h"
+#include "gguf.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "llama.h"
@@ -458,6 +459,106 @@ static std::vector<common_download_task> build_url_tasks(const common_params_mod
     return tasks;
 }
 
+static std::string gguf_get_arch(const std::string & path) {
+    gguf_init_params gparams = { /*no_alloc*/ true, /*ctx*/ nullptr };
+    gguf_context * ctx = gguf_init_from_file(path.c_str(), gparams);
+    if (!ctx) {
+        return "";
+    }
+    std::string arch;
+    const int64_t key = gguf_find_key(ctx, "general.architecture");
+    if (key >= 0 && gguf_get_kv_type(ctx, key) == GGUF_TYPE_STRING) {
+        arch = gguf_get_val_str(ctx, key);
+    }
+    gguf_free(ctx);
+    return arch;
+}
+
+// image generation repos ship only the diffusion transformer, the text encoder and VAE live elsewhere
+static void imgen_apply_companions(common_params & params, common_download_opts opts) {
+    struct companions {
+        const char * arch;
+        const char * text_encoder;
+        const char * vae;
+    };
+    static const companions defaults[] = {
+        { "qwen_image", "unsloth/Qwen2.5-VL-7B-Instruct-GGUF:Q4_K_M", "Comfy-Org/Qwen-Image_ComfyUI" },
+        { "lumina2",    "unsloth/Qwen3-4B-GGUF:Q8_0",                  "Comfy-Org/z_image_turbo"     },
+    };
+
+    if (params.model.path.empty() || !string_ends_with(params.model.path, ".gguf")) {
+        return;
+    }
+    const std::string arch = gguf_get_arch(params.model.path);
+    const companions * def = nullptr;
+    for (const auto & d : defaults) {
+        if (arch == d.arch) {
+            def = &d;
+        }
+    }
+    if (!def) {
+        return;
+    }
+
+    auto & te  = params.imgen.text_encoder;
+    auto & vae = params.imgen.vae;
+    if (te.path.empty() && te.hf_repo.empty() && te.url.empty()) {
+        te.hf_repo = def->text_encoder;
+    }
+    if (vae.path.empty() && vae.hf_repo.empty() && vae.url.empty()) {
+        vae.hf_repo = def->vae;
+    }
+
+    opts.download_mmproj = false;
+    opts.download_mtp    = false;
+    opts.download_eagle3 = false;
+    opts.download_dflash = false;
+    opts.download_dspark = false;
+
+    std::vector<common_download_task> tasks;
+    auto add = [&](common_params_model & model, const common_download_hf_plan & plan) {
+        for (const auto & f : plan.model_files) {
+            const bool is_primary = f.path == plan.primary.path;
+            tasks.emplace_back(f, opts, [&model, f, is_primary]() {
+                if (is_primary) {
+                    model.path = hf_cache::finalize_file(f);
+                } else {
+                    hf_cache::finalize_file(f);
+                }
+            });
+        }
+    };
+
+    common_download_hf_plan plan_te, plan_vae;
+    if (te.path.empty() && !te.hf_repo.empty()) {
+        plan_te = common_download_get_hf_plan(te, opts);
+        add(te, plan_te);
+    }
+    if (vae.path.empty() && !vae.hf_repo.empty()) {
+        plan_vae = common_download_get_hf_vae_plan(vae, opts);
+        add(vae, plan_vae);
+    }
+    if (te.path.empty() && !te.url.empty()) {
+        te.path = get_default_local_path(te.url);
+        auto url_tasks = build_url_tasks(te, opts);
+        tasks.insert(tasks.end(), url_tasks.begin(), url_tasks.end());
+    }
+    if (vae.path.empty() && !vae.url.empty()) {
+        vae.path = get_default_local_path(vae.url);
+        auto url_tasks = build_url_tasks(vae, opts);
+        tasks.insert(tasks.end(), url_tasks.begin(), url_tasks.end());
+    }
+
+    if (!params.offline) {
+        common_download_run_tasks(tasks);
+    }
+    for (const auto & task : tasks) {
+        if (task.on_done) {
+            task.on_done();
+        }
+    }
+}
+
 void common_models_handler_apply(common_models_handler & handler, common_params & params, common_download_callback * callback) {
     std::vector<common_download_task> tasks;
 
@@ -707,6 +808,8 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             task.on_done();
         }
     }
+
+    imgen_apply_companions(params, opts);
 }
 
 //
@@ -1409,6 +1512,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         params.out_file = "output.wav";
         params.sampling.penalty_repeat = 1.05f;
         params.sampling.penalty_last_n = -1;
+    } else if (ex == LLAMA_EXAMPLE_IMGEN) {
+        params.out_file = "output.png";
     }
 
     params.use_color = tty_can_use_colors();
@@ -3101,6 +3206,61 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_HF_FILE"));
     add_opt(common_arg(
+        {"--text-encoder"}, "FILE",
+        "text encoder GGUF for image generation models (Qwen2.5-VL for qwen_image, Qwen3 for lumina2)\n"
+        "note: downloaded automatically when omitted",
+        [](common_params & params, const std::string & value) {
+            params.imgen.text_encoder.path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMGEN, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TEXT_ENCODER"));
+    add_opt(common_arg(
+        {"--text-encoder-hf"}, "<user>/<model>[:quant]",
+        "Hugging Face repository of the text encoder for image generation models",
+        [](common_params & params, const std::string & value) {
+            params.imgen.text_encoder.hf_repo = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMGEN, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TEXT_ENCODER_HF"));
+    add_opt(common_arg(
+        {"--vae"}, "FILE",
+        "VAE decoder (safetensors or GGUF) for image generation models\n"
+        "note: downloaded automatically when omitted",
+        [](common_params & params, const std::string & value) {
+            params.imgen.vae.path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMGEN, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VAE"));
+    add_opt(common_arg(
+        {"--vae-hf"}, "<user>/<model>[:file]",
+        "Hugging Face repository of the VAE for image generation models",
+        [](common_params & params, const std::string & value) {
+            params.imgen.vae.hf_repo = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMGEN, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VAE_HF"));
+    add_opt(common_arg(
+        {"--width"}, "N",
+        string_format("image width, multiple of 16 (default: %d)", params.imgen.width),
+        [](common_params & params, int value) { params.imgen.width = value; }
+    ).set_examples({LLAMA_EXAMPLE_IMGEN}));
+    add_opt(common_arg(
+        {"--height"}, "N",
+        string_format("image height, multiple of 16 (default: %d)", params.imgen.height),
+        [](common_params & params, int value) { params.imgen.height = value; }
+    ).set_examples({LLAMA_EXAMPLE_IMGEN}));
+    add_opt(common_arg(
+        {"--steps"}, "N",
+        "number of denoising steps (default: model dependent)",
+        [](common_params & params, int value) { params.imgen.steps = value; }
+    ).set_examples({LLAMA_EXAMPLE_IMGEN}));
+    add_opt(common_arg(
+        {"--cfg-scale"}, "N",
+        "classifier-free guidance scale, <= 1 disables it (default: model dependent)",
+        [](common_params & params, const std::string & value) { params.imgen.cfg_scale = std::stof(value); }
+    ).set_examples({LLAMA_EXAMPLE_IMGEN}));
+    add_opt(common_arg(
+        {"--negative-prompt"}, "PROMPT",
+        "negative prompt, used when cfg-scale > 1",
+        [](common_params & params, const std::string & value) { params.imgen.negative_prompt = value; }
+    ).set_examples({LLAMA_EXAMPLE_IMGEN}));
+    add_opt(common_arg(
         {"-hft", "--hf-token"}, "TOKEN",
         "Hugging Face access token (default: value from HF_TOKEN environment variable)",
         [](common_params & params, const std::string & value) {
@@ -3176,7 +3336,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.out_file = value;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_CVECTOR_GENERATOR, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_FINETUNE,
-                    LLAMA_EXAMPLE_RESULTS, LLAMA_EXAMPLE_EXPORT_GRAPH_OPS, LLAMA_EXAMPLE_CLI}));
+                    LLAMA_EXAMPLE_RESULTS, LLAMA_EXAMPLE_EXPORT_GRAPH_OPS, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_IMGEN}));
     add_opt(common_arg(
         {"-ofreq", "--output-frequency"}, "N",
         string_format("output the imatrix every N iterations (default: %d)", params.n_out_freq),

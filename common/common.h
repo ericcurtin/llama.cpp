@@ -108,6 +108,7 @@ enum llama_example {
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
     LLAMA_EXAMPLE_DOWNLOAD,
     LLAMA_EXAMPLE_TOKENIZE,
+    LLAMA_EXAMPLE_IMGEN,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -414,6 +415,18 @@ struct common_params_diffusion {
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
 };
 
+// text-to-image generation (tools/imgen)
+struct common_params_imgen {
+    struct common_params_model text_encoder; // Qwen2.5-VL (qwen_image) or Qwen3 (lumina2)
+    struct common_params_model vae;          // safetensors or GGUF VAE decoder
+
+    int32_t     width     = 1024;
+    int32_t     height    = 1024;
+    int32_t     steps     = 0;    // 0 = model default
+    float       cfg_scale = -1.0f; // < 0 = model default
+    std::string negative_prompt;
+};
+
 // reasoning API response format (not to be confused as chat template's reasoning format)
 // only used by server
 enum common_reasoning_format {
@@ -501,6 +514,7 @@ struct common_params {
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
     struct common_params_diffusion   diffusion;
+    struct common_params_imgen       imgen;
 
     struct common_params_model model;
 
