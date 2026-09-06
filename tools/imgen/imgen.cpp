@@ -65,14 +65,6 @@ imgen_runner::imgen_runner(const imgen_params & params, int max_nodes) : max_nod
             }
             IMGEN_LOG("trace %-14s %-40s [%6lld %6lld %4lld] mean=% .5f rms=%.5f\n", ggml_op_desc(t), t->name,
                       (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], sum / vals.size(), std::sqrt(sum2 / vals.size()));
-            const char * dir = getenv("IMGEN_DEBUG_DUMP");
-            if (dir && strncmp(t->name, "node_", 5) != 0 && strchr(t->name, ' ') == nullptr) {
-                FILE * f = fopen((std::string(dir) + "/" + t->name + ".bin").c_str(), "wb");
-                if (f) {
-                    fwrite(vals.data(), sizeof(float), vals.size(), f);
-                    fclose(f);
-                }
-            }
             return true;
         }, nullptr);
     }
@@ -326,14 +318,6 @@ void imgen_image_free(imgen_image * img) {
 static void debug_stats(const imgen_context & ctx, const char * name, const std::vector<float> & v) {
     if (!ctx.params.verbose) {
         return;
-    }
-    if (const char * dir = getenv("IMGEN_DEBUG_DUMP")) {
-        static int n_dump = 0;
-        FILE * f = fopen((std::string(dir) + "/" + std::to_string(n_dump++) + "_" + name + ".bin").c_str(), "wb");
-        if (f) {
-            fwrite(v.data(), sizeof(float), v.size(), f);
-            fclose(f);
-        }
     }
     double sum = 0, sum2 = 0;
     float vmin = INFINITY, vmax = -INFINITY;

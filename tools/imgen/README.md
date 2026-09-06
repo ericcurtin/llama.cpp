@@ -41,3 +41,5 @@ Extra request fields: `steps`, `guidance_scale`, `negative_prompt`, `seed`, `wid
 - 3-axis RoPE is applied with precomputed cos/sin tables, since the per-axis frequency bases differ from `ggml_rope_multi`.
 - The Wan VAE is a causal 3D conv network. A single frame only sees the last temporal slice of each kernel, so the decoder runs as a 2D network.
 - BF16 weights are converted to F16 on load; quantized DiT tensors are used as-is.
+- Activations of both models exceed the F16 range, which backends use for matmul inputs and flash attention K/V. The affected inputs are pre-scaled and the outputs scaled back (`FFN_DOWN_SCALE`, `ATTN_OUT_SCALE`, `ATTN_V_SCALE` in `imgen-dit.cpp`), and matmuls request F32 accumulation.
+- Debugging: `IMGEN_DEBUG_TRACE=1` prints per-node statistics of every graph, `IMGEN_DEBUG_NAN=1` aborts at the first node producing a non-finite value.
