@@ -39,9 +39,12 @@ imgen_runner::imgen_runner(const imgen_params & params, int max_nodes) : max_nod
 
     IMGEN_LOG("%s: using %s backend\n", __func__, ggml_backend_name(backends[0]));
 
-    // the Metal direct conv kernel is much slower than im2col + matmul
+    // only the Vulkan direct conv kernel beats im2col + matmul (10x either way at 1024x1024)
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[0]));
-    conv_im2col = reg && strcmp(ggml_backend_reg_name(reg), "MTL") == 0;
+    conv_im2col = !reg || strcmp(ggml_backend_reg_name(reg), "Vulkan") != 0;
+    if (const char * env = getenv("IMGEN_CONV_IM2COL")) {
+        conv_im2col = atoi(env) != 0;
+    }
 
     sched.reset(ggml_backend_sched_new(backends.data(), bufts.data(), backends.size(), max_nodes, false, true));
 

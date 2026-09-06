@@ -80,7 +80,7 @@ struct imgen_runner {
     int                  max_nodes = 0;
     int                  n_threads = 0;
     bool                 flash_attn = true;
-    bool                 conv_im2col = false; // im2col + matmul instead of the direct conv kernel
+    bool                 conv_im2col = true; // im2col + matmul instead of the direct conv kernel
 
     imgen_runner(const imgen_params & params, int max_nodes);
     ~imgen_runner();
