@@ -65,6 +65,14 @@ imgen_runner::imgen_runner(const imgen_params & params, int max_nodes) : max_nod
             }
             IMGEN_LOG("trace %-14s %-40s [%6lld %6lld %4lld] mean=% .5f rms=%.5f\n", ggml_op_desc(t), t->name,
                       (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], sum / vals.size(), std::sqrt(sum2 / vals.size()));
+            const char * dir = getenv("IMGEN_DEBUG_DUMP");
+            if (dir && strncmp(t->name, "node_", 5) != 0 && strchr(t->name, ' ') == nullptr) {
+                FILE * f = fopen((std::string(dir) + "/" + t->name + ".bin").c_str(), "wb");
+                if (f) {
+                    fwrite(vals.data(), sizeof(float), vals.size(), f);
+                    fclose(f);
+                }
+            }
             return true;
         }, nullptr);
     }
@@ -360,7 +368,7 @@ static std::vector<float> make_sigmas(const imgen_context & ctx, int n_steps, in
         // stretch so the last sigma lands on shift_terminal
         const float shift_terminal = 0.02f;
         const float scale = (1.0f - sigmas[n_steps - 1]) / (1.0f - shift_terminal);
-        for (int i = 0; i < n_steps; i++) {
+        for (int i = 0; i < n_steps && scale > 0.0f; i++) {
             sigmas[i] = 1.0f - (1.0f - sigmas[i]) / scale;
         }
     } else {

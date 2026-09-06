@@ -18,14 +18,15 @@ struct tensor_src {
     size_t               offset;     // absolute byte offset in file
 };
 
-ggml_type target_type(const tensor_src & src, bool keep_type) {
+// BF16 is converted to F16, except for vectors (biases, norms) which are used as F32 operands
+ggml_type target_type(const tensor_src & src, size_t n_dims, bool keep_type) {
     if (src.type == GGML_TYPE_BF16) {
-        return GGML_TYPE_F16;
+        return n_dims <= 1 ? GGML_TYPE_F32 : GGML_TYPE_F16;
     }
     if (keep_type || (src.type != GGML_TYPE_F32 && src.type != GGML_TYPE_F16)) {
         return src.type;
     }
-    return src.ne.size() <= 1 ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    return n_dims <= 1 ? GGML_TYPE_F32 : GGML_TYPE_F16;
 }
 
 // drop size-1 dims of vectors stored as [C,1,1,1], keep everything else
@@ -170,7 +171,7 @@ void imgen_load_weights(const std::string & path, ggml_backend_buffer_type_t buf
         if (ne.size() > GGML_MAX_DIMS) {
             throw std::runtime_error("imgen: tensor " + src.name + " has too many dims");
         }
-        ggml_type type = target_type(src, keep_type);
+        ggml_type type = target_type(src, ne.size(), keep_type);
         ggml_tensor * t = ggml_new_tensor(out.ctx.get(), type, ne.size(), ne.data());
         ggml_set_name(t, src.name.c_str());
         out.tensors[src.name] = t;

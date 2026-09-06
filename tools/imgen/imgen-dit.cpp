@@ -6,9 +6,12 @@
 
 namespace {
 
-// the FFN hidden activations of these models reach 1e5, which overflows the F16 that
-// several backends use for matmul inputs; the down projection input is pre-scaled by this
+// activations of these models reach 1e5, which overflows the F16 that backends use for
+// matmul inputs and for the K/V of flash attention; the affected inputs are pre-scaled by
+// these factors and the outputs scaled back
 constexpr float FFN_DOWN_SCALE = 64.0f;
+constexpr float ATTN_OUT_SCALE = 32.0f;
+constexpr float ATTN_V_SCALE   = 128.0f;
 
 struct input_data {
     ggml_tensor * t;
@@ -83,6 +86,7 @@ struct dit_graph {
         const int64_t hd = q->ne[0], nh = q->ne[1], L = q->ne[2];
         const float scale = 1.0f / std::sqrt((float) hd);
         ggml_tensor * out;
+        v = ggml_scale(g, v, 1.0f / ATTN_V_SCALE);
         if (ctx.runner->flash_attn) {
             k = ggml_cast(g, k, GGML_TYPE_F16);
             v = ggml_cast(g, v, GGML_TYPE_F16);
@@ -102,6 +106,7 @@ struct dit_graph {
             ggml_mul_mat_set_prec(out, GGML_PREC_F32);
             out = ggml_cont(g, ggml_permute(g, out, 0, 2, 1, 3)); // [hd, nh, L]
         }
+        out = ggml_scale(g, out, ATTN_V_SCALE);
         return ggml_reshape_2d(g, out, hd * nh, L);
     }
 
@@ -185,8 +190,8 @@ struct qwen_image_graph : dit_graph {
             ggml_tensor * attn_txt = ggml_view_2d(g, attn, dim, n_txt, attn->nb[1], 0);
             ggml_tensor * attn_img = ggml_view_2d(g, attn, dim, n_img, attn->nb[1], (size_t) n_txt * attn->nb[1]);
 
-            img = ggml_add(g, img, ggml_mul(g, linear(attn_img, pfx + "attn.to_out.0"),  chunk(img_mod, 2, dim)));
-            txt = ggml_add(g, txt, ggml_mul(g, linear(attn_txt, pfx + "attn.to_add_out"), chunk(txt_mod, 2, dim)));
+            img = ggml_add(g, img, ggml_mul(g, linear(attn_img, pfx + "attn.to_out.0",  ATTN_OUT_SCALE), chunk(img_mod, 2, dim)));
+            txt = ggml_add(g, txt, ggml_mul(g, linear(attn_txt, pfx + "attn.to_add_out", ATTN_OUT_SCALE), chunk(txt_mod, 2, dim)));
 
             ggml_tensor * img_m2 = modulate(ggml_norm(g, img, hp.eps), chunk(img_mod, 4, dim), chunk(img_mod, 3, dim));
             ggml_tensor * img_ff = linear(ggml_gelu(g, linear(img_m2, pfx + "img_mlp.net.0.proj")), pfx + "img_mlp.net.2", FFN_DOWN_SCALE);
@@ -195,7 +200,10 @@ struct qwen_image_graph : dit_graph {
             ggml_tensor * txt_m2 = modulate(ggml_norm(g, txt, hp.eps), chunk(txt_mod, 4, dim), chunk(txt_mod, 3, dim));
             ggml_tensor * txt_ff = linear(ggml_gelu(g, linear(txt_m2, pfx + "txt_mlp.net.0.proj")), pfx + "txt_mlp.net.2", FFN_DOWN_SCALE);
             txt = ggml_add(g, txt, ggml_mul(g, txt_ff, chunk(txt_mod, 5, dim)));
+            ggml_format_name(img, "img_out_%d", il);
+            ggml_format_name(txt, "txt_out_%d", il);
         }
+        ggml_set_name(temb, "temb");
 
         ggml_tensor * mod_out = linear(temb_act, "norm_out.linear");
         img = modulate(ggml_norm(g, img, hp.eps), chunk(mod_out, 0, dim), chunk(mod_out, 1, dim));
@@ -255,7 +263,7 @@ struct lumina2_graph : dit_graph {
         q = rope(rms_norm(q, w(pfx + "attention.q_norm.weight"), hp.eps), cos, sin);
         k = rope(rms_norm(k, w(pfx + "attention.k_norm.weight"), hp.eps), cos, sin);
 
-        ggml_tensor * attn = linear(attention(q, k, v), pfx + "attention.out");
+        ggml_tensor * attn = linear(attention(q, k, v), pfx + "attention.out", ATTN_OUT_SCALE);
         attn = rms_norm(attn, w(pfx + "attention_norm2.weight"), hp.eps);
         x = ggml_add(g, x, gate_msa ? ggml_mul(g, attn, gate_msa) : attn);
 
