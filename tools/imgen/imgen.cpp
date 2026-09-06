@@ -141,10 +141,6 @@ void imgen_runner::graph_compute() {
     }
 }
 
-bool imgen_runner::supports(const ggml_tensor * op) const {
-    return ggml_backend_supports_op(backends[0], op);
-}
-
 //
 // public API
 //

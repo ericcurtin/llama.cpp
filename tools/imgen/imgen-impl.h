@@ -87,7 +87,6 @@ struct imgen_runner {
 
     ggml_context * graph_begin();
     void graph_compute();
-    bool supports(const ggml_tensor * op) const;
 };
 
 struct imgen_text_encoder {
