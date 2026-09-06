@@ -21,7 +21,8 @@ struct vae_graph {
     ggml_tensor * conv(ggml_tensor * x, const std::string & name) {
         ggml_tensor * k = w(name + ".weight");
         const int pad = k->ne[0] / 2;
-        ggml_tensor * y = ggml_conv_2d_direct(g, k, x, 1, 1, pad, pad, 1, 1);
+        ggml_tensor * y = ctx.runner->conv_im2col ? ggml_conv_2d(g, k, x, 1, 1, pad, pad, 1, 1)
+                                                  : ggml_conv_2d_direct(g, k, x, 1, 1, pad, pad, 1, 1);
         if (ggml_tensor * b = ctx.vae.get(name + ".bias", false)) {
             y = ggml_add(g, y, per_channel(b));
         }
