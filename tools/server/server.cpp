@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "server-http.h"
+#include "server-mediagen.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
@@ -196,6 +197,41 @@ int llama_server(common_params & params, int argc, char ** argv) {
     server_routes routes(params, ctx_server);
     server_tools tools;
 
+    // diffusion models are served by libmediagen instead of the llama context
+    // decided before the routes are registered, the handlers are copied then
+    server_mediagen mediagen;
+    const bool is_mediagen_server = !is_router_server && (
+        server_mediagen::is_diffusion_model(params) ||   // local model file
+        !models_handler.plan.vae.path.empty());          // -hf repo with diffusion sidecars
+
+    if (is_mediagen_server) {
+        // no text endpoints with a diffusion model
+        routes.get_metrics                 = mediagen.not_supported;
+        routes.get_props                   = mediagen.get_props;
+        routes.get_models                  = mediagen.get_models;
+        routes.post_completions            = mediagen.not_supported;
+        routes.post_completions_oai        = mediagen.not_supported;
+        routes.post_chat_completions       = mediagen.not_supported;
+        routes.post_control                = mediagen.not_supported;
+        routes.post_responses_oai          = mediagen.not_supported;
+        routes.post_transcriptions_oai     = mediagen.not_supported;
+        routes.post_anthropic_messages     = mediagen.not_supported;
+        routes.post_anthropic_count_tokens = mediagen.not_supported;
+        routes.post_infill                 = mediagen.not_supported;
+        routes.post_embeddings             = mediagen.not_supported;
+        routes.post_embeddings_oai         = mediagen.not_supported;
+        routes.post_rerank                 = mediagen.not_supported;
+        routes.post_tokenize               = mediagen.not_supported;
+        routes.post_detokenize             = mediagen.not_supported;
+        routes.post_apply_template         = mediagen.not_supported;
+        routes.post_chat_completions_tok   = mediagen.not_supported;
+        routes.post_responses_tok_oai      = mediagen.not_supported;
+        routes.get_lora_adapters           = mediagen.not_supported;
+        routes.post_lora_adapters          = mediagen.not_supported;
+        routes.get_slots                   = mediagen.not_supported;
+        routes.post_slots                  = mediagen.not_supported;
+    }
+
     std::optional<server_models_routes> models_routes{};
     if (is_router_server) {
         // setup server instances manager
@@ -231,6 +267,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
+        mediagen.post_images_generations   = models_routes->proxy_post;
+        mediagen.post_videos               = models_routes->proxy_post;
+        mediagen.post_audio_speech         = models_routes->proxy_post;
 
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
@@ -260,6 +299,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
+    ctx_http.post("/v1/images/generations",    ex_wrapper(mediagen.post_images_generations));
+    ctx_http.post("/v1/videos",                ex_wrapper(mediagen.post_videos));
+    ctx_http.get ("/v1/videos/:id",            ex_wrapper(mediagen.get_video));
+    ctx_http.get ("/v1/videos/:id/content",    ex_wrapper(mediagen.get_video_content));
+    ctx_http.post("/v1/audio/speech",          ex_wrapper(mediagen.post_audio_speech));
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
     ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
     ctx_http.post("/embedding",                ex_wrapper(routes.post_embeddings)); // legacy
@@ -399,6 +443,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
     }
 
+    if (is_mediagen_server && !server_mediagen::is_diffusion_model(params)) {
+        SRV_ERR("%s", "the downloaded model is not a supported diffusion model\n");
+        return 1;
+    }
+
     //
     // Start the server
     //
@@ -474,25 +523,43 @@ int llama_server(common_params & params, int argc, char ** argv) {
             });
         }
 
-        if (!ctx_server.load_model(params)) {
-            clean_up();
-            if (ctx_http.thread.joinable()) {
-                ctx_http.thread.join();
+        if (is_mediagen_server) {
+            if (!mediagen.load(params)) {
+                clean_up();
+                if (ctx_http.thread.joinable()) {
+                    ctx_http.thread.join();
+                }
+                SRV_ERR("%s", "exiting due to model loading error\n");
+                return 1;
             }
-            SRV_ERR("%s", "exiting due to model loading error\n");
-            return 1;
+            ctx_http.is_ready.store(true);
+            SRV_INF("%s", "media generation model loaded\n");
+
+            shutdown_handler = [&](int) {
+                mcp_mgr.shutdown();
+                ctx_http.stop();
+            };
+        } else {
+            if (!ctx_server.load_model(params)) {
+                clean_up();
+                if (ctx_http.thread.joinable()) {
+                    ctx_http.thread.join();
+                }
+                SRV_ERR("%s", "exiting due to model loading error\n");
+                return 1;
+            }
+
+            routes.update_meta(ctx_server);
+            ctx_http.is_ready.store(true);
+
+            SRV_INF("%s", "model loaded\n");
+
+            shutdown_handler = [&](int) {
+                mcp_mgr.shutdown();
+                // this will unblock start_loop()
+                ctx_server.terminate();
+            };
         }
-
-        routes.update_meta(ctx_server);
-        ctx_http.is_ready.store(true);
-
-        SRV_INF("%s", "model loaded\n");
-
-        shutdown_handler = [&](int) {
-            mcp_mgr.shutdown();
-            // this will unblock start_loop()
-            ctx_server.terminate();
-        };
     }
 
     // register signal handler if not running by CLI
@@ -532,6 +599,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
 
         // when the HTTP server stops, clean up and exit
+        clean_up();
+    } else if (is_mediagen_server) {
+        if (ctx_http.thread.joinable()) {
+            ctx_http.thread.join(); // keep the main thread alive
+        }
+        mediagen.unload();
         clean_up();
     } else {
         // optionally, notify router server that this instance is ready
