@@ -716,6 +716,117 @@ static hf_cache::hf_file find_best_model(const hf_cache::hf_files & files,
     return {};
 }
 
+//
+// diffusion repositories (see tools/mediagen)
+//
+
+static std::string path_basename(const std::string & path) {
+    auto pos = path.rfind('/');
+    return pos == std::string::npos ? path : path.substr(pos + 1);
+}
+
+static std::string string_lower(const std::string & str) {
+    std::string out = str;
+    for (char & c : out) {
+        c = (char) std::tolower((unsigned char) c);
+    }
+    return out;
+}
+
+static bool is_weights_file(const std::string & path) {
+    return string_ends_with(path, ".gguf") || string_ends_with(path, ".safetensors");
+}
+
+// vae / text projection sidecars of a diffusion model
+static bool is_diffusion_sidecar(const std::string & path) {
+    const std::string name = string_lower(path_basename(path));
+    return is_weights_file(name) &&
+           (name.find("video_vae") != std::string::npos || name.find("_vae.") != std::string::npos ||
+            name.find("embeddings_connectors") != std::string::npos);
+}
+
+bool common_download_is_diffusion_repo(const hf_cache::hf_files & files) {
+    for (const auto & f : files) {
+        if (is_diffusion_sidecar(f.path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// without a tag, prefer the distilled transformer over the dev one
+static hf_cache::hf_file find_best_diffusion_model(const hf_cache::hf_files & files, const std::string & tag) {
+    std::vector<std::string> tags;
+    if (!tag.empty()) {
+        tags.push_back(tag);
+    } else {
+        tags = {"Q4_K_M", "Q8_0"};
+    }
+    hf_cache::hf_file first;
+    for (const auto & t : tags) {
+        std::regex pattern(t + "[.-]", std::regex::icase);
+        for (const auto & f : files) {
+            if (!gguf_filename_is_model(f.path) || is_diffusion_sidecar(f.path) || !std::regex_search(f.path, pattern)) {
+                continue;
+            }
+            if (tag.empty() && string_lower(f.path).find("distilled") != std::string::npos) {
+                return f;
+            }
+            if (first.path.empty()) {
+                first = f;
+            }
+        }
+        if (!first.path.empty()) {
+            return first;
+        }
+    }
+    if (tag.empty()) {
+        for (const auto & f : files) {
+            if (gguf_filename_is_model(f.path) && !is_diffusion_sidecar(f.path)) {
+                return f;
+            }
+        }
+    }
+    return {};
+}
+
+// the sidecar whose file name shares the longest prefix with the model file name
+static hf_cache::hf_file find_best_diffusion_sidecar(const hf_cache::hf_files & files, const std::string & model, const std::string & keyword) {
+    const std::string model_name = string_lower(path_basename(model));
+    hf_cache::hf_file best;
+    size_t best_common = 0;
+    bool found = false;
+    for (const auto & f : files) {
+        const std::string name = string_lower(path_basename(f.path));
+        if (!is_weights_file(name) || name.find(keyword) == std::string::npos) {
+            continue;
+        }
+        size_t common = 0;
+        while (common < name.size() && common < model_name.size() && name[common] == model_name[common]) {
+            common++;
+        }
+        // gguf wins ties
+        if (!found || common > best_common || (common == best_common && string_ends_with(name, ".gguf") && !string_ends_with(best.path, ".gguf"))) {
+            best = f;
+            best_common = common;
+            found = true;
+        }
+    }
+    return best;
+}
+
+// text encoder repo of known diffusion model families
+static std::string diffusion_default_text_encoder(const std::string & model) {
+    const std::string name = string_lower(path_basename(model));
+    if (name.find("ltx-2.5") != std::string::npos || name.find("ltx-2-5") != std::string::npos) {
+        return ""; // needs its own fine-tuned Gemma 4
+    }
+    if (name.find("ltx-2") != std::string::npos || name.find("ltx2") != std::string::npos) {
+        return "ggml-org/gemma-3-12b-it-GGUF:Q4_K_M";
+    }
+    return "";
+}
+
 static void list_available_gguf_files(const hf_cache::hf_files & files) {
     LOG_INF("Available GGUF files:\n");
     for (const auto & f : files) {
@@ -764,7 +875,8 @@ common_download_hf_plan common_download_get_hf_plan(const common_params_model & 
             return plan;
         }
     } else {
-        primary = find_best_model(all, tag);
+        const bool is_diffusion = opts.download_diffusion && common_download_is_diffusion_repo(all);
+        primary = is_diffusion ? find_best_diffusion_model(all, tag) : find_best_model(all, tag);
         // a requested sidecar can resolve on its own, without a full model of the same tag
         if (primary.path.empty() && !opts.download_mtp && !opts.download_dflash && !opts.download_eagle3 && !opts.download_dspark) {
             LOG_ERR("%s: no GGUF files found in repository %s\n", __func__, repo.c_str());
@@ -792,6 +904,15 @@ common_download_hf_plan common_download_get_hf_plan(const common_params_model & 
     }
     if (opts.download_dspark) {
         plan.dspark = find_best_dspark(all, primary.path, tag);
+    }
+    if (opts.download_diffusion && !primary.path.empty() && common_download_is_diffusion_repo(all)) {
+        plan.vae       = find_best_diffusion_sidecar(all, primary.path, "video_vae");
+        if (plan.vae.path.empty()) {
+            plan.vae   = find_best_diffusion_sidecar(all, primary.path, "_vae.");
+        }
+        plan.audio_vae = find_best_diffusion_sidecar(all, primary.path, "audio_vae");
+        plan.text_proj = find_best_diffusion_sidecar(all, primary.path, "embeddings_connectors");
+        plan.text_encoder_repo = diffusion_default_text_encoder(primary.path);
     }
 
     if (primary.path.empty() &&
